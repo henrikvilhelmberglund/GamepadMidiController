@@ -1,4 +1,4 @@
-﻿cmake_minimum_required(VERSION 3.14)  # Ensure minimum version for FetchContent
+﻿cmake_minimum_required(VERSION 3.14)
 project(GamepadMidiController)
 
 # Ensure C++20
@@ -7,20 +7,28 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include(FetchContent)
 
-# Fetch libremidi from Git
+# libremidi
 FetchContent_Declare(
     libremidi
     GIT_REPOSITORY https://github.com/celtera/libremidi.git
     GIT_TAG        v5.3.1
 )
+# libgamepad
+FetchContent_Declare(
+    libgamepad
+    GIT_REPOSITORY https://github.com/univrsal/libgamepad
+    GIT_TAG        v1.1
+)
 
 FetchContent_MakeAvailable(libremidi)
+FetchContent_MakeAvailable(libgamepad)
 
-# Add executable
+target_compile_definitions(libgamepad PRIVATE DEBUG=0)
+
 add_executable(GamepadMidiController
     GamepadMidiController.cpp
     GamepadMidiController.h
 )
 
-# Link libremidi (uses alias target)
 target_link_libraries(GamepadMidiController PRIVATE libremidi::libremidi)
+target_link_libraries(GamepadMidiController PRIVATE gamepad)

@@ -3,7 +3,7 @@
 
 #pragma once
 
+#include <libgamepad.hpp>
 #include <iostream>
 #include <libremidi/libremidi.hpp>
 #include <libremidi/message.hpp>
-#include <windows.h>
