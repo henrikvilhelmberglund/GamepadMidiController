@@ -10,11 +10,13 @@
 #include <thread>
 #include <cwchar>
 
+#ifdef _WIN32
 #include <Windows.h>
 extern "C" {
 #include <hidsdi.h>
 }
 #pragma comment(lib, "hid.lib")
+#endif
 
 namespace sc
 {
@@ -65,14 +67,15 @@ static void build_set_settings(std::array<uint8_t, TRITON_FEATURE_REPORT_SIZE>& 
 
 struct HidCaps
 {
-	USHORT input_len = 0;
-	USHORT output_len = 0;
-	USHORT feature_len = 0;
+	unsigned short input_len = 0;
+	unsigned short output_len = 0;
+	unsigned short feature_len = 0;
 };
 
 static HidCaps query_hid_caps(const char* path)
 {
 	HidCaps caps;
+#ifdef _WIN32
 	HANDLE h = CreateFileA(path, GENERIC_READ | GENERIC_WRITE,
 		FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
 	if (h == INVALID_HANDLE_VALUE) return caps;
@@ -89,6 +92,9 @@ static HidCaps query_hid_caps(const char* path)
 		HidD_FreePreparsedData(pp);
 	}
 	CloseHandle(h);
+#else
+	(void)path; // diagnostic listing not yet wired up for POSIX
+#endif
 	return caps;
 }
 

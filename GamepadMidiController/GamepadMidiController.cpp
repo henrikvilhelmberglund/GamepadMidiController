@@ -3,25 +3,109 @@
 #include "steam_controller.h"
 
 #include <hidapi.h>
-#include <Windows.h>
-#include <conio.h>
 #include <algorithm>
+#include <csignal>
+#include <cstdlib>
 #include <iomanip>
 #include <optional>
 #include <sstream>
 #include <string>
 
+#ifdef _WIN32
+#include <Windows.h>
+#include <conio.h>
+#else
+#include <termios.h>
+#include <unistd.h>
+#include <sys/select.h>
+#endif
+
+namespace platform
+{
+#ifdef _WIN32
+
+	inline void init()
+	{
+		HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+		if (h == INVALID_HANDLE_VALUE) return;
+		DWORD mode = 0;
+		if (!GetConsoleMode(h, &mode)) return;
+		SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+	}
+	inline void cleanup()
+	{
+		// Show cursor (we hide it during dashboard rendering).
+		std::cout << "\033[?25h" << std::flush;
+	}
+	inline bool poll_key(int& out_key)
+	{
+		if (_kbhit()) { out_key = _getch(); return true; }
+		return false;
+	}
+
+#else // POSIX: raw stdin via termios + non-blocking poll via select()
+
+	inline ::termios& saved_tios()
+	{
+		static ::termios t{};
+		return t;
+	}
+	inline bool& tios_saved()
+	{
+		static bool b = false;
+		return b;
+	}
+
+	inline void init()
+	{
+		::termios t{};
+		if (tcgetattr(STDIN_FILENO, &t) == 0)
+		{
+			saved_tios() = t;
+			tios_saved() = true;
+			t.c_lflag &= ~(ICANON | ECHO); // raw, no echo
+			tcsetattr(STDIN_FILENO, TCSANOW, &t);
+		}
+	}
+	inline void cleanup()
+	{
+		if (tios_saved())
+			tcsetattr(STDIN_FILENO, TCSANOW, &saved_tios());
+		const char show_cursor[] = "\033[?25h";
+		(void)write(STDOUT_FILENO, show_cursor, sizeof(show_cursor) - 1);
+	}
+	inline bool poll_key(int& out_key)
+	{
+		fd_set fds;
+		FD_ZERO(&fds);
+		FD_SET(STDIN_FILENO, &fds);
+		::timeval tv{};
+		if (select(STDIN_FILENO + 1, &fds, nullptr, nullptr, &tv) > 0)
+		{
+			unsigned char c = 0;
+			if (read(STDIN_FILENO, &c, 1) == 1) { out_key = c; return true; }
+		}
+		return false;
+	}
+
+#endif
+
+	extern "C" inline void on_signal(int)
+	{
+		cleanup();
+		_Exit(0);
+	}
+
+	inline void install_signal_handler()
+	{
+		std::signal(SIGINT, on_signal);
+		std::signal(SIGTERM, on_signal);
+	}
+
+} // namespace platform
+
 constexpr int BAR_WIDTH = 32;
 constexpr int REDRAW_INTERVAL_MS = 33;
-
-static void enable_vt_mode()
-{
-	HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
-	if (h == INVALID_HANDLE_VALUE) return;
-	DWORD mode = 0;
-	if (!GetConsoleMode(h, &mode)) return;
-	SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
-}
 
 static std::optional<libremidi::output_port> select_midi_out_port()
 {
@@ -940,7 +1024,9 @@ static void redraw(const sc::SCState& s, const MidiEmitter& m, const NoteEmitter
 
 int main()
 {
-	enable_vt_mode();
+	platform::init();
+	std::atexit(platform::cleanup);
+	platform::install_signal_handler();
 
 	std::cout << "GamepadMidiController - Steam Controller Triton + HIDAPI + MIDI\n\n";
 
@@ -1016,9 +1102,9 @@ int main()
 		}
 
 		// Keyboard mode switching: focus the console and press 1, 2, 3, or 4.
-		while (_kbhit())
+		int c;
+		while (platform::poll_key(c))
 		{
-			int c = _getch();
 			if (c == '1') notes.set_layout(mappings::NoteLayout::DIATONIC);
 			else if (c == '2') notes.set_layout(mappings::NoteLayout::CHROMATIC);
 			else if (c == '3') notes.set_layout(mappings::NoteLayout::SCALE);
