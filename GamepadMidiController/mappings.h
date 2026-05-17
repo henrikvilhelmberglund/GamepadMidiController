@@ -145,8 +145,9 @@ constexpr int GYRO_ACCEL_BOOST = 2;
 
 enum class NoteLayout
 {
-	DIATONIC,
-	CHROMATIC,
+	DIATONIC,   // Mode 1: fixed C-major notes per button, momentary modifiers
+	CHROMATIC,  // Mode 2: chromatic intervals from movable root
+	SCALE,      // Mode 3: scale-step offsets, root drifts along a scale (key-locked)
 };
 
 constexpr NoteLayout DEFAULT_NOTE_LAYOUT = NoteLayout::DIATONIC;
@@ -232,5 +233,57 @@ constexpr int CHROMATIC_OFF_R5         = +7; // perfect 5th up
 // Shoulder bumpers - note-emitting in CHROMATIC mode.
 constexpr int CHROMATIC_OFF_LB         = -5; // perfect 4th down
 constexpr int CHROMATIC_OFF_RB         = +5; // perfect 4th up
+
+// ----------------------------------------------------------------------------
+// SCALE (Mode 3)
+// ----------------------------------------------------------------------------
+// Polyphonic, NOT relative: each button plays a fixed note = tonic + scale-step
+// offset. Hold multiple buttons → multiple notes (like Mode 1). Press L3 / R3
+// to cycle through the SCALES list below. QAM toggles tonic between default
+// and alt; Steam saves current tonic as alt. Add/remove scales by editing the
+// SCALES array. Each scale's `intervals` list is its semitone offsets from the
+// scale's own root, looping every octave.
+
+struct Scale
+{
+	const char* name;
+	int interval_count;
+	int intervals[12]; // up to 12 intervals (chromatic); only the first
+	                   //  `interval_count` entries are used.
+};
+
+constexpr Scale SCALES[] = {
+	{ "Major",   7, { 0, 2, 4, 5, 7, 9, 11 } },
+	{ "Minor",   7, { 0, 2, 3, 5, 7, 8, 10 } },
+	{ "PentMaj", 5, { 0, 2, 4, 7, 9 } },
+	{ "PentMin", 5, { 0, 3, 5, 7, 10 } },
+	{ "Blues",   6, { 0, 3, 5, 6, 7, 10 } },
+	{ "Dorian",  7, { 0, 2, 3, 5, 7, 9, 10 } },
+};
+constexpr int SCALE_COUNT = sizeof(SCALES) / sizeof(SCALES[0]);
+
+constexpr int SCALE_DEFAULT_INDEX     = 0;  // start with Major
+constexpr int SCALE_DEFAULT_TONIC     = 60; // C4
+constexpr int SCALE_DEFAULT_ALT_TONIC = 57; // A3 (alt for QAM toggle)
+
+// Scale-step offsets per button. Same numeric values as CHROMATIC mode (Mode
+// 2) but interpreted as scale steps instead of semitones - so each offset
+// "walks" through the scale that many notes.
+constexpr int SCALE_OFF_DPAD_UP    = -3;
+constexpr int SCALE_OFF_DPAD_DOWN  =  0; // root (same as A)
+constexpr int SCALE_OFF_DPAD_RIGHT = -1;
+constexpr int SCALE_OFF_DPAD_LEFT  = -2;
+constexpr int SCALE_OFF_A          =  0; // root
+constexpr int SCALE_OFF_Y          = +3;
+constexpr int SCALE_OFF_X          = +1;
+constexpr int SCALE_OFF_B          = +2;
+constexpr int SCALE_OFF_VIEW       = +4; // Start (left of face buttons)
+constexpr int SCALE_OFF_MENU       = -4; // Select (right of dpad)
+constexpr int SCALE_OFF_L4         = -6;
+constexpr int SCALE_OFF_R4         = +6;
+constexpr int SCALE_OFF_L5         = -7;
+constexpr int SCALE_OFF_R5         = +7;
+constexpr int SCALE_OFF_LB         = -5;
+constexpr int SCALE_OFF_RB         = +5;
 
 } // namespace mappings

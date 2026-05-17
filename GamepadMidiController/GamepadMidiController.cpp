@@ -164,6 +164,12 @@ public:
 	int alt_root() const { return m_alt_root; }
 	int mono_note() const { return m_mono_note; }
 	int current_velocity() const { return m_current_velocity; }
+
+	// SCALE mode getters
+	int scale_tonic() const { return m_tonic; }
+	int scale_alt_tonic() const { return m_alt_tonic; }
+	int scale_index() const { return m_scale_index; }
+	const char* scale_name() const { return mappings::SCALES[m_scale_index].name; }
 	int active_note(int btn) const { return (btn >= 0 && btn < NUM_BUTTONS) ? m_active[btn] : -1; }
 
 	void update(const sc::SCState& cur, const sc::SCState& prev)
@@ -186,8 +192,10 @@ public:
 
 		if (m_layout == mappings::NoteLayout::DIATONIC)
 			update_diatonic(cur, now, was);
-		else
+		else if (m_layout == mappings::NoteLayout::CHROMATIC)
 			update_chromatic(cur, prev, now, was);
+		else
+			update_scale(cur, prev, now, was);
 	}
 
 private:
@@ -343,6 +351,93 @@ private:
 		return n;
 	}
 
+	// === SCALE: polyphonic, fixed (no root drift). Each button plays
+	// (tonic + scale-step offset) in the currently-selected scale.
+	// L3/R3 cycle scales, QAM toggles tonic, Steam saves alt tonic.
+	void update_scale(const sc::SCState& cur, const sc::SCState& prev,
+		const bool /*now*/[], const bool /*was*/[])
+	{
+		// Scale changes
+		if (cur.l3 && !prev.l3)
+			m_scale_index = (m_scale_index + mappings::SCALE_COUNT - 1) % mappings::SCALE_COUNT;
+		if (cur.r3 && !prev.r3)
+			m_scale_index = (m_scale_index + 1) % mappings::SCALE_COUNT;
+
+		// Tonic toggle + save
+		if (cur.qam && !prev.qam)
+		{
+			m_at_alt = !m_at_alt;
+			m_tonic = m_at_alt ? m_alt_tonic : mappings::SCALE_DEFAULT_TONIC;
+		}
+		if (cur.steam && !prev.steam)
+		{
+			m_alt_tonic = m_tonic;
+		}
+
+		bool buttons_now[NUM_BUTTONS] = {
+			cur.dpad_down, cur.dpad_right, cur.dpad_left, cur.dpad_up,
+			cur.a, cur.b, cur.x, cur.y,
+			cur.view, cur.menu,
+			cur.l4, cur.r4, cur.l5, cur.r5,
+			cur.lb, cur.rb
+		};
+		bool buttons_was[NUM_BUTTONS] = {
+			prev.dpad_down, prev.dpad_right, prev.dpad_left, prev.dpad_up,
+			prev.a, prev.b, prev.x, prev.y,
+			prev.view, prev.menu,
+			prev.l4, prev.r4, prev.l5, prev.r5,
+			prev.lb, prev.rb
+		};
+
+		// Releases: stop notes for buttons no longer held.
+		for (int i = 0; i < NUM_BUTTONS; ++i)
+		{
+			if (!buttons_now[i] && buttons_was[i] && m_active[i] >= 0)
+			{
+				m_m.send_note_off(static_cast<uint8_t>(m_active[i]));
+				m_active[i] = -1;
+			}
+		}
+
+		// Presses: play the fixed note for this button.
+		for (int i = 0; i < NUM_BUTTONS; ++i)
+		{
+			if (buttons_now[i] && !buttons_was[i])
+			{
+				if (m_active[i] >= 0)
+					m_m.send_note_off(static_cast<uint8_t>(m_active[i]));
+				int n = clamp_midi(scale_step_to_midi_with(
+					scale_step_offset(i), m_tonic, mappings::SCALES[m_scale_index]));
+				m_active[i] = n;
+				m_m.send_note_on(static_cast<uint8_t>(n), static_cast<uint8_t>(m_current_velocity));
+			}
+		}
+	}
+
+	static int scale_step_to_midi_with(int step, int tonic, const mappings::Scale& s)
+	{
+		int n = s.interval_count;
+		int octave = step / n;
+		int idx = step - octave * n;
+		if (idx < 0) { idx += n; octave -= 1; }
+		return tonic + 12 * octave + s.intervals[idx];
+	}
+
+	static int scale_step_offset(int button)
+	{
+		static constexpr int OFFSET[NUM_BUTTONS] = {
+			mappings::SCALE_OFF_DPAD_DOWN, mappings::SCALE_OFF_DPAD_RIGHT,
+			mappings::SCALE_OFF_DPAD_LEFT, mappings::SCALE_OFF_DPAD_UP,
+			mappings::SCALE_OFF_A, mappings::SCALE_OFF_B,
+			mappings::SCALE_OFF_X, mappings::SCALE_OFF_Y,
+			mappings::SCALE_OFF_VIEW, mappings::SCALE_OFF_MENU,
+			mappings::SCALE_OFF_L4, mappings::SCALE_OFF_R4,
+			mappings::SCALE_OFF_L5, mappings::SCALE_OFF_R5,
+			mappings::SCALE_OFF_LB, mappings::SCALE_OFF_RB,
+		};
+		return OFFSET[button];
+	}
+
 	void stack_push(int btn, bool primary)
 	{
 		if (m_stack_count < NUM_BUTTONS) m_press_stack[m_stack_count++] = { btn, primary };
@@ -439,6 +534,11 @@ private:
 	struct PressInfo { int button; bool primary; };
 	PressInfo m_press_stack[NUM_BUTTONS] = {};
 	int m_stack_count = 0;
+
+	// SCALE mode state: fixed tonic + selectable scale, polyphonic.
+	int m_scale_index = mappings::SCALE_DEFAULT_INDEX;
+	int m_tonic = mappings::SCALE_DEFAULT_TONIC;
+	int m_alt_tonic = mappings::SCALE_DEFAULT_ALT_TONIC;
 };
 
 static void emit_state(MidiEmitter& m, const sc::SCState& s)
@@ -650,10 +750,13 @@ static void redraw(const sc::SCState& s, const MidiEmitter& m, const NoteEmitter
 		<< " L4:" << on_off(s.l4) << "L5:" << on_off(s.l5)
 		<< " R4:" << on_off(s.r4) << "R5:" << on_off(s.r5) << "\033[K\n";
 	{
-		bool diatonic = (n.layout() == mappings::NoteLayout::DIATONIC);
-		os << "  Notes:    mode=" << (diatonic ? "DIATONIC " : "CHROMATIC")
-			<< " (press 1 or 2)  ";
-		if (diatonic)
+		auto layout = n.layout();
+		const char* mode_name =
+			layout == mappings::NoteLayout::DIATONIC  ? "DIATONIC " :
+			layout == mappings::NoteLayout::CHROMATIC ? "CHROMATIC" :
+			                                            "SCALE    ";
+		os << "  Notes:    mode=" << mode_name << " (press 1/2/3)  ";
+		if (layout == mappings::NoteLayout::DIATONIC)
 		{
 			os << "offset=" << std::showpos << n.total_offset() << std::noshowpos << " semis";
 			os << "  active=[";
@@ -670,13 +773,21 @@ static void redraw(const sc::SCState& s, const MidiEmitter& m, const NoteEmitter
 			}
 			os << "]";
 		}
-		else
+		else if (layout == mappings::NoteLayout::CHROMATIC)
 		{
 			os << "root=" << n.root() << " home=" << n.home_root()
 				<< " alt=" << n.alt_root() << " vel=" << n.current_velocity()
 				<< " playing=";
 			if (n.mono_note() >= 0) os << n.mono_note();
 			else os << "-";
+		}
+		else
+		{
+			os << "scale=" << n.scale_name()
+				<< " tonic=" << n.scale_tonic()
+				<< " alt=" << n.scale_alt_tonic()
+				<< " vel=" << n.current_velocity()
+				<< "  L3/R3=cycle scale";
 		}
 		os << "\033[K\n";
 	}
@@ -768,12 +879,13 @@ int main()
 			continue;
 		}
 
-		// Keyboard mode switching: focus the console and press 1 or 2.
+		// Keyboard mode switching: focus the console and press 1, 2, or 3.
 		while (_kbhit())
 		{
 			int c = _getch();
 			if (c == '1') notes.set_layout(mappings::NoteLayout::DIATONIC);
 			else if (c == '2') notes.set_layout(mappings::NoteLayout::CHROMATIC);
+			else if (c == '3') notes.set_layout(mappings::NoteLayout::SCALE);
 		}
 
 		emit_state(emitter, state);
