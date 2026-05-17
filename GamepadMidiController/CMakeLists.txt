@@ -30,6 +30,7 @@ unset(BUILD_SHARED_LIBS CACHE)
 add_executable(GamepadMidiController
     GamepadMidiController.cpp
     GamepadMidiController.h
+    mappings.h
     steam_controller.cpp
     steam_controller.h
 )
