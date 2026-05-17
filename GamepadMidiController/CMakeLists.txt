@@ -13,20 +13,26 @@ FetchContent_Declare(
     GIT_REPOSITORY https://github.com/celtera/libremidi.git
     GIT_TAG        v5.3.1
 )
-# libgamepad
+# hidapi (direct Steam Controller HID access)
 FetchContent_Declare(
-    libgamepad
-    GIT_REPOSITORY https://github.com/univrsal/libgamepad
-    GIT_TAG        v1.1
+    hidapi
+    GIT_REPOSITORY https://github.com/libusb/hidapi.git
+    GIT_TAG        hidapi-0.15.0
 )
 
 FetchContent_MakeAvailable(libremidi)
-FetchContent_MakeAvailable(libgamepad)
+
+# Build hidapi as a static library so we don't have to ship hidapi.dll alongside the exe.
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(hidapi)
+unset(BUILD_SHARED_LIBS CACHE)
 
 add_executable(GamepadMidiController
     GamepadMidiController.cpp
     GamepadMidiController.h
+    steam_controller.cpp
+    steam_controller.h
 )
 
 target_link_libraries(GamepadMidiController PRIVATE libremidi::libremidi)
-target_link_libraries(GamepadMidiController PRIVATE gamepad)
+target_link_libraries(GamepadMidiController PRIVATE hidapi::hidapi)
