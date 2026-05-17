@@ -53,6 +53,80 @@ constexpr uint16_t IMU_MODE_SEND_RAW_GYRO      = 0x0010;
 constexpr uint8_t TRITON_FEATURE_REPORT_ID = 0x01;
 constexpr size_t TRITON_FEATURE_REPORT_SIZE = 64;
 
+// Input report IDs.
+constexpr uint8_t ID_TRITON_CONTROLLER_STATE     = 0x42;
+constexpr uint8_t ID_TRITON_BATTERY_STATUS       = 0x43;
+constexpr uint8_t ID_TRITON_CONTROLLER_STATE_BLE = 0x45;
+
+// Triton button mask bits (within a 32-bit field).
+constexpr uint32_t TRITON_BTN_A          = 0x00000001;
+constexpr uint32_t TRITON_BTN_B          = 0x00000002;
+constexpr uint32_t TRITON_BTN_X          = 0x00000004;
+constexpr uint32_t TRITON_BTN_Y          = 0x00000008;
+constexpr uint32_t TRITON_BTN_QAM        = 0x00000010;
+constexpr uint32_t TRITON_BTN_R3         = 0x00000020;
+constexpr uint32_t TRITON_BTN_VIEW       = 0x00000040;
+constexpr uint32_t TRITON_BTN_R4         = 0x00000080;
+constexpr uint32_t TRITON_BTN_R5         = 0x00000100;
+constexpr uint32_t TRITON_BTN_RB         = 0x00000200;
+constexpr uint32_t TRITON_BTN_DPAD_DOWN  = 0x00000400;
+constexpr uint32_t TRITON_BTN_DPAD_RIGHT = 0x00000800;
+constexpr uint32_t TRITON_BTN_DPAD_LEFT  = 0x00001000;
+constexpr uint32_t TRITON_BTN_DPAD_UP    = 0x00002000;
+constexpr uint32_t TRITON_BTN_MENU       = 0x00004000;
+constexpr uint32_t TRITON_BTN_L3         = 0x00008000;
+constexpr uint32_t TRITON_BTN_STEAM      = 0x00010000;
+constexpr uint32_t TRITON_BTN_L4         = 0x00020000;
+constexpr uint32_t TRITON_BTN_L5         = 0x00040000;
+constexpr uint32_t TRITON_BTN_LB         = 0x00080000;
+constexpr uint32_t TRITON_BTN_RSTICK_TOUCH = 0x00100000;
+constexpr uint32_t TRITON_BTN_RPAD_TOUCH   = 0x00200000;
+constexpr uint32_t TRITON_BTN_RPAD_CLICK   = 0x00400000;
+constexpr uint32_t TRITON_BTN_RTRIG_CLICK  = 0x00800000;
+constexpr uint32_t TRITON_BTN_LSTICK_TOUCH = 0x01000000;
+constexpr uint32_t TRITON_BTN_LPAD_TOUCH   = 0x02000000;
+constexpr uint32_t TRITON_BTN_LPAD_CLICK   = 0x04000000;
+constexpr uint32_t TRITON_BTN_LTRIG_CLICK  = 0x08000000;
+constexpr uint32_t TRITON_BTN_RGRIP_TOUCH  = 0x10000000;
+constexpr uint32_t TRITON_BTN_LGRIP_TOUCH  = 0x20000000;
+
+// Parsed controller state (one snapshot from one input report).
+struct SCState
+{
+	uint8_t seq_num = 0;
+	uint32_t buttons_raw = 0;
+
+	// Digital
+	bool a = false, b = false, x = false, y = false;
+	bool lb = false, rb = false;
+	bool l3 = false, r3 = false;           // stick clicks
+	bool view = false, menu = false;       // back/start
+	bool steam = false, qam = false;       // guide-style
+	bool dpad_up = false, dpad_down = false, dpad_left = false, dpad_right = false;
+	bool l4 = false, r4 = false, l5 = false, r5 = false;
+	bool lpad_touch = false, rpad_touch = false;
+	bool lpad_click = false, rpad_click = false;
+	bool ltrig_click = false, rtrig_click = false;
+	bool lstick_touch = false, rstick_touch = false;
+	bool lgrip_touch = false, rgrip_touch = false;
+
+	// Analog (signed int16 unless noted)
+	int16_t ltrigger = 0, rtrigger = 0;        // 0..32767
+	int16_t lstick_x = 0, lstick_y = 0;        // -32768..+32767
+	int16_t rstick_x = 0, rstick_y = 0;
+	int16_t lpad_x = 0, lpad_y = 0;
+	int16_t rpad_x = 0, rpad_y = 0;
+	uint16_t lpad_pressure = 0, rpad_pressure = 0;
+
+	// IMU
+	int16_t accel_x = 0, accel_y = 0, accel_z = 0;
+	int16_t gyro_x = 0, gyro_y = 0, gyro_z = 0;
+};
+
+// Parse a raw input report into SCState. Returns false if the report isn't a
+// controller state packet or is too short.
+bool parse_triton_report(const uint8_t* buf, size_t len, SCState& out);
+
 struct RawReport
 {
 	std::vector<uint8_t> bytes;

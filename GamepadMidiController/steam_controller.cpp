@@ -246,4 +246,91 @@ std::optional<RawReport> SteamController::read(int timeout_ms)
 	return r;
 }
 
+bool parse_triton_report(const uint8_t* buf, size_t len, SCState& out)
+{
+	if (!buf || len < 1) return false;
+	if (buf[0] != ID_TRITON_CONTROLLER_STATE && buf[0] != ID_TRITON_CONTROLLER_STATE_BLE)
+		return false;
+
+	// Triton MTU NoQuat layout (45 bytes) — the Full variant adds 8 bytes of
+	// quaternion at the tail which we ignore for now.
+	constexpr size_t kMinPayload = 45;
+	if (len < 1 + kMinPayload) return false;
+
+	const uint8_t* p = buf + 1;
+	auto u16 = [](const uint8_t* x) -> uint16_t {
+		return static_cast<uint16_t>(x[0]) | (static_cast<uint16_t>(x[1]) << 8);
+	};
+	auto i16 = [&](const uint8_t* x) -> int16_t {
+		return static_cast<int16_t>(u16(x));
+	};
+	auto u32 = [](const uint8_t* x) -> uint32_t {
+		return static_cast<uint32_t>(x[0])
+			| (static_cast<uint32_t>(x[1]) << 8)
+			| (static_cast<uint32_t>(x[2]) << 16)
+			| (static_cast<uint32_t>(x[3]) << 24);
+	};
+
+	out.seq_num = p[0];
+	uint32_t b = u32(p + 1);
+	out.buttons_raw = b;
+
+	out.a           = (b & TRITON_BTN_A) != 0;
+	out.b           = (b & TRITON_BTN_B) != 0;
+	out.x           = (b & TRITON_BTN_X) != 0;
+	out.y           = (b & TRITON_BTN_Y) != 0;
+	out.qam         = (b & TRITON_BTN_QAM) != 0;
+	out.r3          = (b & TRITON_BTN_R3) != 0;
+	out.view        = (b & TRITON_BTN_VIEW) != 0;
+	out.r4          = (b & TRITON_BTN_R4) != 0;
+	out.r5          = (b & TRITON_BTN_R5) != 0;
+	out.rb          = (b & TRITON_BTN_RB) != 0;
+	out.dpad_down   = (b & TRITON_BTN_DPAD_DOWN) != 0;
+	out.dpad_right  = (b & TRITON_BTN_DPAD_RIGHT) != 0;
+	out.dpad_left   = (b & TRITON_BTN_DPAD_LEFT) != 0;
+	out.dpad_up     = (b & TRITON_BTN_DPAD_UP) != 0;
+	out.menu        = (b & TRITON_BTN_MENU) != 0;
+	out.l3          = (b & TRITON_BTN_L3) != 0;
+	out.steam       = (b & TRITON_BTN_STEAM) != 0;
+	out.l4          = (b & TRITON_BTN_L4) != 0;
+	out.l5          = (b & TRITON_BTN_L5) != 0;
+	out.lb          = (b & TRITON_BTN_LB) != 0;
+	out.rstick_touch = (b & TRITON_BTN_RSTICK_TOUCH) != 0;
+	out.rpad_touch  = (b & TRITON_BTN_RPAD_TOUCH) != 0;
+	out.rpad_click  = (b & TRITON_BTN_RPAD_CLICK) != 0;
+	out.rtrig_click = (b & TRITON_BTN_RTRIG_CLICK) != 0;
+	out.lstick_touch = (b & TRITON_BTN_LSTICK_TOUCH) != 0;
+	out.lpad_touch  = (b & TRITON_BTN_LPAD_TOUCH) != 0;
+	out.lpad_click  = (b & TRITON_BTN_LPAD_CLICK) != 0;
+	out.ltrig_click = (b & TRITON_BTN_LTRIG_CLICK) != 0;
+	out.rgrip_touch = (b & TRITON_BTN_RGRIP_TOUCH) != 0;
+	out.lgrip_touch = (b & TRITON_BTN_LGRIP_TOUCH) != 0;
+
+	out.ltrigger = i16(p + 5);
+	out.rtrigger = i16(p + 7);
+
+	out.lstick_x = i16(p + 9);
+	out.lstick_y = i16(p + 11);
+	out.rstick_x = i16(p + 13);
+	out.rstick_y = i16(p + 15);
+
+	out.lpad_x = i16(p + 17);
+	out.lpad_y = i16(p + 19);
+	out.lpad_pressure = u16(p + 21);
+
+	out.rpad_x = i16(p + 23);
+	out.rpad_y = i16(p + 25);
+	out.rpad_pressure = u16(p + 27);
+
+	// imu.timestamp at offset 29 (4 bytes) - skipped
+	out.accel_x = i16(p + 33);
+	out.accel_y = i16(p + 35);
+	out.accel_z = i16(p + 37);
+	out.gyro_x  = i16(p + 39);
+	out.gyro_y  = i16(p + 41);
+	out.gyro_z  = i16(p + 43);
+
+	return true;
+}
+
 } // namespace sc
