@@ -165,11 +165,12 @@ public:
 	int mono_note() const { return m_mono_note; }
 	int current_velocity() const { return m_current_velocity; }
 
-	// SCALE mode getters
+	// SCALE/CHORD mode getters
 	int scale_tonic() const { return m_tonic; }
 	int scale_alt_tonic() const { return m_alt_tonic; }
 	int scale_index() const { return m_scale_index; }
 	const char* scale_name() const { return mappings::SCALES[m_scale_index].name; }
+	bool chord_root_mode() const { return m_chord_root_mode; }
 	int active_note(int btn) const { return (btn >= 0 && btn < NUM_BUTTONS) ? m_active[btn] : -1; }
 
 	void update(const sc::SCState& cur, const sc::SCState& prev)
@@ -194,8 +195,10 @@ public:
 			update_diatonic(cur, now, was);
 		else if (m_layout == mappings::NoteLayout::CHROMATIC)
 			update_chromatic(cur, prev, now, was);
-		else
+		else if (m_layout == mappings::NoteLayout::SCALE)
 			update_scale(cur, prev, now, was);
+		else
+			update_chord(cur, prev);
 	}
 
 private:
@@ -215,6 +218,17 @@ private:
 			m_mono_note = -1;
 		}
 		m_stack_count = 0;
+		// CHORD voices
+		for (int i = 0; i < NUM_BUTTONS; ++i)
+		{
+			for (int v = 0; v < m_chord_voice_count[i]; ++v)
+			{
+				if (m_chord_notes[i][v] >= 0)
+					m_m.send_note_off(static_cast<uint8_t>(m_chord_notes[i][v]));
+				m_chord_notes[i][v] = -1;
+			}
+			m_chord_voice_count[i] = 0;
+		}
 	}
 
 	// === DIATONIC: momentary modifiers + sustain ===
@@ -423,6 +437,114 @@ private:
 		return tonic + 12 * octave + s.intervals[idx];
 	}
 
+	// === CHORD: each button plays a chord. Two sub-modes toggled by QAM.
+	// Polyphonic: hold multiple buttons to layer chords.
+	void update_chord(const sc::SCState& cur, const sc::SCState& prev)
+	{
+		// L3/R3 behavior depends on sub-mode:
+		// - default (scale-degree): cycle scales (major / minor / ...)
+		// - root mode: shift tonic by perfect 5ths (circle-of-5ths key change)
+		bool l3 = cur.l3 && !prev.l3;
+		bool r3 = cur.r3 && !prev.r3;
+		if (m_chord_root_mode)
+		{
+			if (l3) m_tonic -= 7;
+			if (r3) m_tonic += 7;
+			// Wrap within one octave (C3..B3) so the cycle stays in audible range.
+			while (m_tonic > 71) m_tonic -= 12;
+			while (m_tonic < 48) m_tonic += 12;
+		}
+		else
+		{
+			if (l3) m_scale_index = (m_scale_index + mappings::SCALE_COUNT - 1) % mappings::SCALE_COUNT;
+			if (r3) m_scale_index = (m_scale_index + 1) % mappings::SCALE_COUNT;
+		}
+		// QAM toggles between default (scale-degree chords) and root mode.
+		if (cur.qam && !prev.qam)
+			m_chord_root_mode = !m_chord_root_mode;
+		if (cur.steam && !prev.steam)
+			m_alt_tonic = m_tonic;
+
+		bool buttons_now[NUM_BUTTONS] = {
+			cur.dpad_down, cur.dpad_right, cur.dpad_left, cur.dpad_up,
+			cur.a, cur.b, cur.x, cur.y,
+			cur.view, cur.menu,
+			cur.l4, cur.r4, cur.l5, cur.r5,
+			cur.lb, cur.rb
+		};
+		bool buttons_was[NUM_BUTTONS] = {
+			prev.dpad_down, prev.dpad_right, prev.dpad_left, prev.dpad_up,
+			prev.a, prev.b, prev.x, prev.y,
+			prev.view, prev.menu,
+			prev.l4, prev.r4, prev.l5, prev.r5,
+			prev.lb, prev.rb
+		};
+
+		const mappings::Scale& s = mappings::SCALES[m_scale_index];
+
+		// Releases: stop every voice for buttons no longer held.
+		for (int i = 0; i < NUM_BUTTONS; ++i)
+		{
+			if (!buttons_now[i] && buttons_was[i])
+			{
+				for (int v = 0; v < m_chord_voice_count[i]; ++v)
+				{
+					if (m_chord_notes[i][v] >= 0)
+						m_m.send_note_off(static_cast<uint8_t>(m_chord_notes[i][v]));
+					m_chord_notes[i][v] = -1;
+				}
+				m_chord_voice_count[i] = 0;
+			}
+		}
+
+		// Presses: build a chord. In default mode, triad on the button's
+		// scale-step. In root mode, the button's chord-quality voicing
+		// rooted at the tonic.
+		for (int i = 0; i < NUM_BUTTONS; ++i)
+		{
+			if (buttons_now[i] && !buttons_was[i])
+			{
+				// Stop any straggler voices for this button first.
+				for (int v = 0; v < m_chord_voice_count[i]; ++v)
+				{
+					if (m_chord_notes[i][v] >= 0)
+						m_m.send_note_off(static_cast<uint8_t>(m_chord_notes[i][v]));
+				}
+				int size = 0;
+				int notes[mappings::CHORD_MAX_VOICES] = {};
+				if (m_chord_root_mode)
+				{
+					// Composition palette: scale-degree functional chord.
+					const mappings::CompChord& cc = mappings::COMP_CHORDS[i];
+					size = cc.voice_count;
+					if (size > mappings::CHORD_MAX_VOICES) size = mappings::CHORD_MAX_VOICES;
+					for (int j = 0; j < size; ++j)
+					{
+						int voice_step = cc.root_step + cc.voice_offsets[j];
+						notes[j] = clamp_midi(scale_step_to_midi_with(voice_step, m_tonic, s));
+					}
+				}
+				else
+				{
+					// Default: triad rooted at the button's scale-step offset.
+					int root_step = scale_step_offset(i);
+					size = 3;
+					for (int j = 0; j < size; ++j)
+					{
+						int voice_step = root_step + j * 2; // stack of 3rds
+						notes[j] = clamp_midi(scale_step_to_midi_with(voice_step, m_tonic, s));
+					}
+				}
+				for (int j = 0; j < size; ++j)
+				{
+					m_chord_notes[i][j] = notes[j];
+					m_m.send_note_on(static_cast<uint8_t>(notes[j]), static_cast<uint8_t>(m_current_velocity));
+				}
+				m_chord_voice_count[i] = size;
+			}
+		}
+	}
+
 	static int scale_step_offset(int button)
 	{
 		static constexpr int OFFSET[NUM_BUTTONS] = {
@@ -535,10 +657,16 @@ private:
 	PressInfo m_press_stack[NUM_BUTTONS] = {};
 	int m_stack_count = 0;
 
-	// SCALE mode state: fixed tonic + selectable scale, polyphonic.
+	// SCALE / CHORD mode shared state: fixed tonic + selectable scale.
 	int m_scale_index = mappings::SCALE_DEFAULT_INDEX;
 	int m_tonic = mappings::SCALE_DEFAULT_TONIC;
 	int m_alt_tonic = mappings::SCALE_DEFAULT_ALT_TONIC;
+
+	// CHORD mode: per-button voice buffer for polyphonic chord playback,
+	// plus a flag for the root-mode sub-toggle (QAM toggles this).
+	int m_chord_notes[NUM_BUTTONS][mappings::CHORD_MAX_VOICES] = {};
+	int m_chord_voice_count[NUM_BUTTONS] = {};
+	bool m_chord_root_mode = false;
 };
 
 static void emit_state(MidiEmitter& m, const sc::SCState& s)
@@ -754,8 +882,9 @@ static void redraw(const sc::SCState& s, const MidiEmitter& m, const NoteEmitter
 		const char* mode_name =
 			layout == mappings::NoteLayout::DIATONIC  ? "DIATONIC " :
 			layout == mappings::NoteLayout::CHROMATIC ? "CHROMATIC" :
-			                                            "SCALE    ";
-		os << "  Notes:    mode=" << mode_name << " (press 1/2/3)  ";
+			layout == mappings::NoteLayout::SCALE     ? "SCALE    " :
+			                                            "CHORD    ";
+		os << "  Notes:    mode=" << mode_name << " (press 1/2/3/4)  ";
 		if (layout == mappings::NoteLayout::DIATONIC)
 		{
 			os << "offset=" << std::showpos << n.total_offset() << std::noshowpos << " semis";
@@ -785,9 +914,16 @@ static void redraw(const sc::SCState& s, const MidiEmitter& m, const NoteEmitter
 		{
 			os << "scale=" << n.scale_name()
 				<< " tonic=" << n.scale_tonic()
-				<< " alt=" << n.scale_alt_tonic()
-				<< " vel=" << n.current_velocity()
-				<< "  L3/R3=cycle scale";
+				<< " vel=" << n.current_velocity();
+			if (layout == mappings::NoteLayout::CHORD)
+			{
+				if (n.chord_root_mode())
+					os << "  PALETTE  L3/R3=key (5ths)  QAM=toggle";
+				else
+					os << "  scale-degree  L3/R3=scale  QAM=toggle";
+			}
+			else
+				os << "  alt=" << n.scale_alt_tonic() << "  L3/R3=cycle scale";
 		}
 		os << "\033[K\n";
 	}
@@ -879,13 +1015,14 @@ int main()
 			continue;
 		}
 
-		// Keyboard mode switching: focus the console and press 1, 2, or 3.
+		// Keyboard mode switching: focus the console and press 1, 2, 3, or 4.
 		while (_kbhit())
 		{
 			int c = _getch();
 			if (c == '1') notes.set_layout(mappings::NoteLayout::DIATONIC);
 			else if (c == '2') notes.set_layout(mappings::NoteLayout::CHROMATIC);
 			else if (c == '3') notes.set_layout(mappings::NoteLayout::SCALE);
+			else if (c == '4') notes.set_layout(mappings::NoteLayout::CHORD);
 		}
 
 		emit_state(emitter, state);

@@ -146,8 +146,9 @@ constexpr int GYRO_ACCEL_BOOST = 2;
 enum class NoteLayout
 {
 	DIATONIC,   // Mode 1: fixed C-major notes per button, momentary modifiers
-	CHROMATIC,  // Mode 2: chromatic intervals from movable root
-	SCALE,      // Mode 3: scale-step offsets, root drifts along a scale (key-locked)
+	CHROMATIC,  // Mode 2: chromatic intervals from movable root (mono, drift)
+	SCALE,      // Mode 3: fixed scale-degree notes, switchable scale (polyphonic)
+	CHORD,      // Mode 4: each button plays a diatonic triad on its scale degree
 };
 
 constexpr NoteLayout DEFAULT_NOTE_LAYOUT = NoteLayout::DIATONIC;
@@ -253,12 +254,22 @@ struct Scale
 };
 
 constexpr Scale SCALES[] = {
-	{ "Major",   7, { 0, 2, 4, 5, 7, 9, 11 } },
-	{ "Minor",   7, { 0, 2, 3, 5, 7, 8, 10 } },
-	{ "PentMaj", 5, { 0, 2, 4, 7, 9 } },
-	{ "PentMin", 5, { 0, 3, 5, 7, 10 } },
-	{ "Blues",   6, { 0, 3, 5, 6, 7, 10 } },
-	{ "Dorian",  7, { 0, 2, 3, 5, 7, 9, 10 } },
+	// === Diatonic modes ===
+	{ "Major",      7, { 0, 2, 4, 5, 7, 9, 11 } },  // Ionian
+	{ "Minor",      7, { 0, 2, 3, 5, 7, 8, 10 } },  // Aeolian (natural minor)
+	{ "Dorian",     7, { 0, 2, 3, 5, 7, 9, 10 } },  // minor with raised 6th
+	{ "Phrygian",   7, { 0, 1, 3, 5, 7, 8, 10 } },  // minor with flat 2nd
+	{ "Lydian",     7, { 0, 2, 4, 6, 7, 9, 11 } },  // major with raised 4th
+	{ "Mixolydian", 7, { 0, 2, 4, 5, 7, 9, 10 } },  // major with flat 7th
+	{ "Locrian",    7, { 0, 1, 3, 5, 6, 8, 10 } },  // dim, "saddest" mode
+	// === Pentatonic / blues ===
+	{ "PentMaj",    5, { 0, 2, 4, 7, 9 } },
+	{ "PentMin",    5, { 0, 3, 5, 7, 10 } },
+	{ "Blues",      6, { 0, 3, 5, 6, 7, 10 } },
+	// === Japanese ===
+	{ "Hirajoshi",  5, { 0, 2, 3, 7, 8 } },         // koto-style, very Japanese
+	{ "In",         5, { 0, 1, 5, 7, 8 } },         // shakuhachi-style
+	{ "Insen",      5, { 0, 1, 5, 7, 10 } },        // Japanese minor pentatonic
 };
 constexpr int SCALE_COUNT = sizeof(SCALES) / sizeof(SCALES[0]);
 
@@ -275,8 +286,8 @@ constexpr int SCALE_OFF_DPAD_RIGHT = -1;
 constexpr int SCALE_OFF_DPAD_LEFT  = -2;
 constexpr int SCALE_OFF_A          =  0; // root
 constexpr int SCALE_OFF_Y          = +3;
-constexpr int SCALE_OFF_X          = +1;
-constexpr int SCALE_OFF_B          = +2;
+constexpr int SCALE_OFF_X          = +2;
+constexpr int SCALE_OFF_B          = +1;
 constexpr int SCALE_OFF_VIEW       = +4; // Start (left of face buttons)
 constexpr int SCALE_OFF_MENU       = -4; // Select (right of dpad)
 constexpr int SCALE_OFF_L4         = -6;
@@ -285,5 +296,64 @@ constexpr int SCALE_OFF_L5         = -7;
 constexpr int SCALE_OFF_R5         = +7;
 constexpr int SCALE_OFF_LB         = -5;
 constexpr int SCALE_OFF_RB         = +5;
+
+// ----------------------------------------------------------------------------
+// CHORD (Mode 4)
+// ----------------------------------------------------------------------------
+// Two sub-modes, toggled by QAM:
+//
+//   Default (QAM off): each button plays a diatonic TRIAD rooted at
+//   (tonic + SCALE_OFF_*). Different scale degrees → different chord qualities
+//   automatically (e.g. in major: I-Maj, ii-min, iii-min, IV-Maj, V-Maj, vi-min,
+//   vii-dim).
+//
+//   Root mode (QAM on): every button plays a chord rooted at the SAME tonic,
+//   but with a different chord *quality* per button (see ROOT_CHORD_TYPES).
+//   So you get C-Maj, C-min, C-7, C-Maj7, C-dim, etc. for the same tonic C.
+//
+// L3/R3 cycle the scale (Major, Minor, ...); Steam saves current tonic as alt.
+
+constexpr int CHORD_MAX_VOICES = 8;
+
+// Composition palette: a curated set of useful chords for songwriting (I, IV,
+// V, vi, V7, sus, etc.) rooted at different scale degrees. Each chord adapts
+// to the current scale, so the same button gives the "functional" chord in
+// any key. Order matches the internal button index: dpad DOWN, RIGHT, LEFT,
+// UP, A, B, X, Y, VIEW (Start), MENU (Select), L4, R4, L5, R5, LB, RB.
+struct CompChord
+{
+	const char* name;
+	int root_step;          // scale step (from tonic) where this chord is rooted
+	int voice_count;
+	int voice_offsets[8];   // scale-step offsets from root_step
+};
+
+// Right-thumb face buttons hold the I-V-IV-vi pop/classical core (vi on Y for
+// easy access — the I-V-vi-IV progression is one A→B→Y→X sweep). DPad covers
+// the next four diatonic chords including V7 for cadences. Suspensions and
+// 7ths fill the extras with a classical flavor (no jazz extensions).
+constexpr CompChord COMP_CHORDS[16] = {
+	// === DPad: secondary diatonic chords ===
+	{ "ii",      1, 3, { 0, 2, 4 } },        // 0: DPad DOWN - supertonic
+	{ "vii",     6, 3, { 0, 2, 4 } },        // 1: DPad RIGHT - leading tone dim
+	{ "iii",     2, 3, { 0, 2, 4 } },        // 2: DPad LEFT - mediant
+	{ "V7",      4, 4, { 0, 2, 4, 6 } },     // 3: DPad UP - dominant 7th
+	// === Face: primary chords (I-V-IV-vi) ===
+	{ "I",       0, 3, { 0, 2, 4 } },        // 4: A - tonic
+	{ "V",       4, 3, { 0, 2, 4 } },        // 5: B - dominant
+	{ "IV",      3, 3, { 0, 2, 4 } },        // 6: X - subdominant
+	{ "vi",      5, 3, { 0, 2, 4 } },        // 7: Y - relative minor
+	// === Start / Select: tonic & vi sevenths ===
+	{ "Imaj7",   0, 4, { 0, 2, 4, 6 } },     // 8: VIEW (Start)
+	{ "vi7",     5, 4, { 0, 2, 4, 6 } },     // 9: MENU (Select)
+	// === Paddles: pre-dominants + classical suspensions ===
+	{ "ii7",     1, 4, { 0, 2, 4, 6 } },     // 10: L4 - ii 7th
+	{ "V7sus4",  4, 4, { 0, 3, 4, 6 } },     // 11: R4 - V7 with 4 suspended
+	{ "Vsus4",   4, 3, { 0, 3, 4 } },        // 12: L5 - V triad suspended
+	{ "IVmaj7",  3, 4, { 0, 2, 4, 6 } },     // 13: R5 - subdominant 7th
+	// === Bumpers: tail-end variations ===
+	{ "iii7",    2, 4, { 0, 2, 4, 6 } },     // 14: LB - iii 7th
+	{ "Imaj9",   0, 5, { 0, 2, 4, 6, 8 } },  // 15: RB - tonic 9 (extended I)
+};
 
 } // namespace mappings
