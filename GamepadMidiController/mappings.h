@@ -35,15 +35,16 @@ constexpr uint8_t MIDI_CHANNEL = 0;
 // MIDI range 102-118 is used for Triton-specific inputs (capacitive touch,
 // grip buttons, paddles, etc.) so they don't collide with anything standard.
 
-// Sticks & trackpads (Surge XT macros 1-8)
-constexpr uint8_t CC_LSX = 41; // left stick X  -> macro 1
-constexpr uint8_t CC_LSY = 42; // left stick Y  -> macro 2
-constexpr uint8_t CC_RSX = 43; // right stick X -> macro 3
-constexpr uint8_t CC_RSY = 44; // right stick Y -> macro 4
-constexpr uint8_t CC_LPX = 45; // left pad X    -> macro 5
-constexpr uint8_t CC_LPY = 46; // left pad Y    -> macro 6
-constexpr uint8_t CC_RPX = 47; // right pad X   -> macro 7
-constexpr uint8_t CC_RPY = 48; // right pad Y   -> macro 8
+// Trackpads + sticks (Surge XT macros 1-8). Trackpads on 1-4 because they
+// retain their position when released, sticks on 5-8 since they spring back.
+constexpr uint8_t CC_LPX = 41; // left pad X    -> macro 1
+constexpr uint8_t CC_LPY = 42; // left pad Y    -> macro 2
+constexpr uint8_t CC_RPX = 43; // right pad X   -> macro 3
+constexpr uint8_t CC_RPY = 44; // right pad Y   -> macro 4
+constexpr uint8_t CC_LSX = 45; // left stick X  -> macro 5
+constexpr uint8_t CC_LSY = 46; // left stick Y  -> macro 6
+constexpr uint8_t CC_RSX = 47; // right stick X -> macro 7
+constexpr uint8_t CC_RSY = 48; // right stick Y -> macro 8
 
 // Triggers, individual
 constexpr uint8_t CC_LTRIGGER = 5;
@@ -62,8 +63,8 @@ constexpr uint8_t CC_LB    = 24;
 constexpr uint8_t CC_RB    = 25;
 constexpr uint8_t CC_L3    = 26;  // left stick click
 constexpr uint8_t CC_R3    = 27;  // right stick click
-constexpr uint8_t CC_VIEW  = 28;  // back / select
-constexpr uint8_t CC_MENU  = 29;  // start
+constexpr uint8_t CC_VIEW  = 28;  // Start (left of face buttons)
+constexpr uint8_t CC_MENU  = 29;  // Select / Back (right of dpad)
 constexpr uint8_t CC_DPAD_UP    = 30;
 constexpr uint8_t CC_DPAD_DOWN  = 31;
 constexpr uint8_t CC_DPAD_LEFT  = 32;
@@ -108,7 +109,7 @@ constexpr int ACCX_DEADZONE = 3000;
 
 // Raw |accel_x| that maps to CC 127 (full mod wheel). ~16384 = 1g of tilt.
 // Lower this for more sensitivity (less tilt to reach max mod wheel).
-constexpr int ACCX_MAX = 16384;
+constexpr int ACCX_MAX = 13000;
 
 // ----------------------------------------------------------------------------
 // PITCH BEND
@@ -126,14 +127,57 @@ constexpr bool ENABLE_PITCH_BEND_FROM_TRIGGERS = true;
 constexpr int GYRO_ACCEL_BOOST = 2;
 
 // ----------------------------------------------------------------------------
-// MIDI NOTES
+// NOTE LAYOUTS
 // ----------------------------------------------------------------------------
-// MIDI note number that each D-pad / face button plays. Defaults are a
-// C-major diatonic scale starting at middle C (60). Change for other scales
-// or layouts.
+// Two modes are available; switch between them at runtime by focusing the
+// console window and pressing '1' (DIATONIC) or '2' (CHROMATIC).
 //
-// MIDI numbers: 60 = middle C, 61 = C#, 62 = D, 63 = D#, 64 = E, 65 = F, ...
-//               69 = A4 (440 Hz), 72 = C5, 84 = C6, etc.
+//   DIATONIC  - Each button plays a fixed MIDI note (C major scale by default).
+//               Modifiers (LB/RB/L4/R4/L5/R5) are MOMENTARY semitone shifts:
+//               holding a modifier transposes any held notes; releasing it
+//               transposes back. Releasing a face button while a modifier is
+//               held sustains the note until all modifiers also release.
+//
+//   CHROMATIC - Each button plays an interval relative to a movable root note.
+//               Modifiers TAP-SHIFT the root permanently (no momentary state):
+//               press R4 once and the root moves up 1 semitone forever, until
+//               you shift it back or press R3 to reset to C.
+
+enum class NoteLayout
+{
+	DIATONIC,
+	CHROMATIC,
+};
+
+constexpr NoteLayout DEFAULT_NOTE_LAYOUT = NoteLayout::DIATONIC;
+
+// Velocity sent with every note_on (0-127). Applies to both layouts when
+// ENABLE_ACCY_VELOCITY is false; otherwise this is the fallback ceiling.
+constexpr int NOTE_VELOCITY = 100;
+
+// AccY-driven velocity: tilt the controller "up" (positive AccY beyond the
+// deadzone) to soften notes. Flat / tilted down = max velocity. Same deadzone
+// shape as the AccX mod-wheel mapping.
+constexpr bool ENABLE_ACCY_VELOCITY = true;
+constexpr int ACCY_VELOCITY_DEADZONE = 3000;  // raw |AccY| below this = max velocity
+constexpr int ACCY_VELOCITY_MAX_RAW = 12000;  // raw AccY where velocity bottoms out (lower = steeper)
+constexpr int VELOCITY_MIN = 1;               // 0 would be a note-off, so floor at 1
+constexpr int VELOCITY_MAX = 127;
+
+// Set to false to disable note emission entirely (buttons still send their
+// digital CCs from the CC ASSIGNMENTS section above).
+constexpr bool ENABLE_NOTES = true;
+
+// When true, trackpad CCs only update while the surface is being touched
+// (capacitive sense). On release, the CC "freezes" at the last value.
+// Sticks always send live values - they spring back to center physically.
+constexpr bool FREEZE_TRACKPADS_ON_RELEASE = true;
+
+// ----------------------------------------------------------------------------
+// DIATONIC (Mode 1)
+// ----------------------------------------------------------------------------
+// MIDI note number each button plays. Default = C major diatonic from middle
+// C (60). MIDI: 60=C, 61=C#, 62=D, 63=D#, 64=E, 65=F, 67=G, 69=A, 71=B, 72=C+1.
 
 constexpr int NOTE_DPAD_DOWN  = 60; // C
 constexpr int NOTE_DPAD_RIGHT = 62; // D
@@ -144,29 +188,49 @@ constexpr int NOTE_B          = 69; // A
 constexpr int NOTE_X          = 71; // B
 constexpr int NOTE_Y          = 72; // C+1
 
-// Velocity sent with every note_on (0-127).
-constexpr int NOTE_VELOCITY = 100;
-
-// Set to false to disable note emission entirely (face buttons still send their
-// CC events from the digital-button section above).
-constexpr bool ENABLE_NOTES = true;
-
-// ----------------------------------------------------------------------------
-// MODIFIER DELTAS (semitones)
-// ----------------------------------------------------------------------------
-// Each modifier is a momentary hold. While held, it adds this many semitones
-// to the currently-playing note(s). Sums combine, e.g. LB + R4 = -12 + 1 = -11.
-// Each press/release retriggers held notes so you can play arpeggios.
-//
-// Releasing a face button while ANY of these is held keeps the note sustained
-// until every modifier is also released (so you can play monophonic-synth
-// melodies by tapping modifiers while a face button is held, then sustain).
-
+// Momentary semitone shifts in DIATONIC mode. Sum of held modifiers = total
+// offset added to the played note. E.g. LB + R4 held = -12 + 1 = -11.
 constexpr int MOD_LB = -12; // octave down
 constexpr int MOD_RB = +12; // octave up
 constexpr int MOD_L4 = -1;  // semitone down
 constexpr int MOD_R4 = +1;  // semitone up
 constexpr int MOD_L5 = -2;  // whole tone down
 constexpr int MOD_R5 = +2;  // whole tone up
+
+// ----------------------------------------------------------------------------
+// CHROMATIC (Mode 2)
+// ----------------------------------------------------------------------------
+// Step-instrument: every press plays (root + offset) AND advances root to that
+// new note. A has offset 0 so pressing A plays the root without changing it.
+// LB/RB silently nudge root by an octave. R3 resets root to default.
+
+constexpr int CHROMATIC_DEFAULT_ROOT = 60;     // middle C (C4)
+constexpr int CHROMATIC_DEFAULT_ALT_ROOT = 57; // A3 (below middle C), QAM toggles between C and this
+
+// D-pad
+constexpr int CHROMATIC_OFF_DPAD_UP    = -3; // minor 3rd down
+constexpr int CHROMATIC_OFF_DPAD_DOWN  =  0; // root (same as A)
+constexpr int CHROMATIC_OFF_DPAD_RIGHT = -1; // semitone down
+constexpr int CHROMATIC_OFF_DPAD_LEFT  = -2; // whole step down
+
+// Face buttons
+constexpr int CHROMATIC_OFF_A          =  0; // root
+constexpr int CHROMATIC_OFF_Y          = +3; // minor 3rd up
+constexpr int CHROMATIC_OFF_X          = +1; // semitone up
+constexpr int CHROMATIC_OFF_B          = +2; // whole step up
+
+// Select / Start (small buttons either side of the controller body)
+constexpr int CHROMATIC_OFF_VIEW       = +4; // Start (left of face buttons), major 3rd up
+constexpr int CHROMATIC_OFF_MENU       = -4; // Select (right of dpad), major 3rd down
+
+// Paddles (rear grip buttons)
+constexpr int CHROMATIC_OFF_L4         = -6; // tritone down
+constexpr int CHROMATIC_OFF_R4         = +6; // tritone up
+constexpr int CHROMATIC_OFF_L5         = -7; // perfect 5th down
+constexpr int CHROMATIC_OFF_R5         = +7; // perfect 5th up
+
+// Shoulder bumpers - note-emitting in CHROMATIC mode.
+constexpr int CHROMATIC_OFF_LB         = -5; // perfect 4th down
+constexpr int CHROMATIC_OFF_RB         = +5; // perfect 4th up
 
 } // namespace mappings

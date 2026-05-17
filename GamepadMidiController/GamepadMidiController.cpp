@@ -4,6 +4,7 @@
 
 #include <hidapi.h>
 #include <Windows.h>
+#include <conio.h>
 #include <algorithm>
 #include <iomanip>
 #include <optional>
@@ -125,45 +126,99 @@ private:
 
 // Drives MIDI note_on / note_off from the controller's button state.
 //
-// Mapping (C major scale, root note 60 = middle C):
-//   DPAD_DOWN  -> C (60)        A -> G (67)
-//   DPAD_RIGHT -> D (62)        B -> A (69)
-//   DPAD_LEFT  -> E (64)        X -> B (71)
-//   DPAD_UP    -> F (65)        Y -> C+1 (72)
+// Two layouts, switchable at runtime by pressing '1' or '2' in the console:
 //
-// All six modifiers are momentary (held). The total pitch offset is the sum of
-// every held modifier's delta. Each modifier state change retriggers any held
-// notes so you can play arpeggios by rapidly tapping a modifier.
+//   DIATONIC (Mode 1) - fixed notes on D-pad + face buttons (C-major scale).
+//     Modifiers (LB/RB/L4/R4/L5/R5) are momentary semitone shifts. Releasing
+//     a face button while a modifier is held sustains the note.
 //
-//   LB: -12   RB: +12        (octave)
-//   L4:  -1   R4:  +1        (semitone)
-//   L5:  -2   R5:  +2        (whole tone)
+//   CHROMATIC (Mode 2) - intervals around a movable root.
+//     D-pad: +-1, +-2 (whole/half steps). Face: 0 / +-4 / +7. View/Menu: +-3.
+//     Modifiers TAP-SHIFT the root permanently. R3 resets root to middle C.
 class NoteEmitter
 {
 public:
-	static constexpr int NUM_BUTTONS = 8;
-	NoteEmitter(MidiEmitter& m) : m_m(m) {}
+	// 4 dpad + 4 face + view + menu + 4 paddles + 2 shoulders (LB/RB).
+	// DIATONIC only uses indices 0..7. CHROMATIC uses all 16.
+	static constexpr int NUM_BUTTONS = 16;
+
+	NoteEmitter(MidiEmitter& m)
+		: m_m(m),
+		  m_layout(mappings::DEFAULT_NOTE_LAYOUT),
+		  m_root(mappings::CHROMATIC_DEFAULT_ROOT)
+	{
+		for (auto& a : m_active) a = -1;
+	}
+
+	void set_layout(mappings::NoteLayout l)
+	{
+		if (l == m_layout) return;
+		release_all();
+		m_layout = l;
+	}
+
+	mappings::NoteLayout layout() const { return m_layout; }
+	int total_offset() const { return m_offset; }
+	int root() const { return m_root; }
+	int home_root() const { return m_home_root; }
+	int alt_root() const { return m_alt_root; }
+	int mono_note() const { return m_mono_note; }
+	int current_velocity() const { return m_current_velocity; }
+	int active_note(int btn) const { return (btn >= 0 && btn < NUM_BUTTONS) ? m_active[btn] : -1; }
 
 	void update(const sc::SCState& cur, const sc::SCState& prev)
 	{
-		int new_offset = compute_offset(cur);
-		bool offset_changed = (new_offset != m_offset);
-		m_offset = new_offset;
-
+		m_current_velocity = compute_velocity(cur);
 		bool now[NUM_BUTTONS] = {
 			cur.dpad_down, cur.dpad_right, cur.dpad_left, cur.dpad_up,
-			cur.a, cur.b, cur.x, cur.y
+			cur.a, cur.b, cur.x, cur.y,
+			cur.view, cur.menu,
+			cur.l4, cur.r4, cur.l5, cur.r5,
+			cur.lb, cur.rb
 		};
 		bool was[NUM_BUTTONS] = {
 			prev.dpad_down, prev.dpad_right, prev.dpad_left, prev.dpad_up,
-			prev.a, prev.b, prev.x, prev.y
+			prev.a, prev.b, prev.x, prev.y,
+			prev.view, prev.menu,
+			prev.l4, prev.r4, prev.l5, prev.r5,
+			prev.lb, prev.rb
 		};
+
+		if (m_layout == mappings::NoteLayout::DIATONIC)
+			update_diatonic(cur, now, was);
+		else
+			update_chromatic(cur, prev, now, was);
+	}
+
+private:
+	void release_all()
+	{
+		for (int i = 0; i < NUM_BUTTONS; ++i)
+		{
+			if (m_active[i] >= 0)
+			{
+				m_m.send_note_off(static_cast<uint8_t>(m_active[i]));
+				m_active[i] = -1;
+			}
+		}
+		if (m_mono_note >= 0)
+		{
+			m_m.send_note_off(static_cast<uint8_t>(m_mono_note));
+			m_mono_note = -1;
+		}
+		m_stack_count = 0;
+	}
+
+	// === DIATONIC: momentary modifiers + sustain ===
+	void update_diatonic(const sc::SCState& cur, const bool now[], const bool was[])
+	{
+		int new_offset = compute_offset_diatonic(cur);
+		bool offset_changed = (new_offset != m_offset);
+		m_offset = new_offset;
 		bool any_mod = any_modifier_held(cur);
 
-		// Step 1: release notes whose face button is no longer held AND no
-		// modifier is acting as a sustain. (If any modifier is held, the note
-		// stays sustained until that modifier also releases.)
-		for (int i = 0; i < NUM_BUTTONS; ++i)
+		// Release notes whose face button is released AND no modifier sustaining.
+		for (int i = 0; i < 8; ++i)
 		{
 			if (m_active[i] >= 0 && !now[i] && !any_mod)
 			{
@@ -172,46 +227,157 @@ public:
 			}
 		}
 
-		// Step 2: offset change retriggers any still-active notes (whether
-		// the button is held or sustained).
+		// Offset change retriggers held notes (arpeggio effect).
 		if (offset_changed)
 		{
-			for (int i = 0; i < NUM_BUTTONS; ++i)
+			for (int i = 0; i < 8; ++i)
 			{
 				if (m_active[i] >= 0)
 				{
 					m_m.send_note_off(static_cast<uint8_t>(m_active[i]));
-					int n = effective_note(i);
+					int n = effective_note_diatonic(i);
 					m_active[i] = (n >= 0 && n <= 127) ? n : -1;
-					if (m_active[i] >= 0) m_m.send_note_on(static_cast<uint8_t>(m_active[i]), mappings::NOTE_VELOCITY);
+					if (m_active[i] >= 0)
+						m_m.send_note_on(static_cast<uint8_t>(m_active[i]), static_cast<uint8_t>(m_current_velocity));
 				}
 			}
 		}
 
-		// Step 3: handle face-button presses (release was handled in step 1).
-		for (int i = 0; i < NUM_BUTTONS; ++i)
+		// New face-button presses.
+		for (int i = 0; i < 8; ++i)
 		{
 			if (now[i] && !was[i])
 			{
 				if (m_active[i] >= 0)
-				{
 					m_m.send_note_off(static_cast<uint8_t>(m_active[i]));
-				}
-				int n = effective_note(i);
+				int n = effective_note_diatonic(i);
 				if (n >= 0 && n <= 127)
 				{
 					m_active[i] = n;
-					m_m.send_note_on(static_cast<uint8_t>(n), mappings::NOTE_VELOCITY);
+					m_m.send_note_on(static_cast<uint8_t>(n), static_cast<uint8_t>(m_current_velocity));
 				}
 			}
 		}
 	}
 
-	int total_offset() const { return m_offset; }
-	int active_note(int btn) const { return (btn >= 0 && btn < NUM_BUTTONS) ? m_active[btn] : -1; }
+	// === CHROMATIC: monophonic press-stack ===
+	// Only the FIRST press (when nothing else is held) advances the root.
+	// Subsequent presses while a button is held just shift the active note.
+	// On release, the note reverts to whichever button is now top of the stack.
+	void update_chromatic(const sc::SCState& cur, const sc::SCState& prev,
+		const bool now[], const bool was[])
+	{
+		// Silent control buttons (don't enter the press stack, don't play notes).
+		// R3/L3 snap to the "home" root (which QAM and Steam update).
+		if (cur.r3 && !prev.r3) m_root = m_home_root;
+		if (cur.l3 && !prev.l3) m_root = m_home_root;
+		if (cur.qam && !prev.qam)
+		{
+			m_at_alt = !m_at_alt;
+			m_root = m_at_alt ? m_alt_root : mappings::CHROMATIC_DEFAULT_ROOT;
+			m_home_root = m_root;
+		}
+		if (cur.steam && !prev.steam)
+		{
+			m_alt_root = m_root;
+			m_home_root = m_root;
+		}
+		if (m_root < 0)   m_root = 0;
+		if (m_root > 127) m_root = 127;
+		if (m_alt_root < 0)   m_alt_root = 0;
+		if (m_alt_root > 127) m_alt_root = 127;
+		if (m_home_root < 0)   m_home_root = 0;
+		if (m_home_root > 127) m_home_root = 127;
 
-private:
-	static int compute_offset(const sc::SCState& s)
+		// Process releases first (remove from stack).
+		for (int i = 0; i < NUM_BUTTONS; ++i)
+		{
+			if (!now[i] && was[i]) stack_remove(i);
+		}
+
+		// Process presses: push to stack, advance root if this is the primary
+		// press (stack was empty before this push).
+		for (int i = 0; i < NUM_BUTTONS; ++i)
+		{
+			if (now[i] && !was[i])
+			{
+				bool primary = (m_stack_count == 0);
+				if (primary)
+				{
+					int n = clamp_midi(m_root + chromatic_offset(i));
+					m_root = n;
+				}
+				stack_push(i, primary);
+			}
+		}
+
+		// Sync the single playing note to whatever sits on top of the stack.
+		// Primary's offset is already absorbed into m_root; secondaries get
+		// their offset added on top.
+		int desired = -1;
+		if (m_stack_count > 0)
+		{
+			const PressInfo& top = m_press_stack[m_stack_count - 1];
+			desired = top.primary
+				? clamp_midi(m_root)
+				: clamp_midi(m_root + chromatic_offset(top.button));
+		}
+		else if (m_mono_note >= 0)
+		{
+			// Last finger just lifted - advance root to the final note that
+			// was playing, so the next press starts relative to it.
+			m_root = m_mono_note;
+		}
+		if (desired != m_mono_note)
+		{
+			if (m_mono_note >= 0) m_m.send_note_off(static_cast<uint8_t>(m_mono_note));
+			if (desired >= 0) m_m.send_note_on(static_cast<uint8_t>(desired), static_cast<uint8_t>(m_current_velocity));
+			m_mono_note = desired;
+		}
+	}
+
+	static int clamp_midi(int n)
+	{
+		if (n < 0) return 0;
+		if (n > 127) return 127;
+		return n;
+	}
+
+	void stack_push(int btn, bool primary)
+	{
+		if (m_stack_count < NUM_BUTTONS) m_press_stack[m_stack_count++] = { btn, primary };
+	}
+
+	void stack_remove(int btn)
+	{
+		for (int i = 0; i < m_stack_count; ++i)
+		{
+			if (m_press_stack[i].button == btn)
+			{
+				for (int j = i; j < m_stack_count - 1; ++j)
+					m_press_stack[j] = m_press_stack[j + 1];
+				--m_stack_count;
+				return;
+			}
+		}
+	}
+
+	static int chromatic_offset(int button)
+	{
+		static constexpr int OFFSET[NUM_BUTTONS] = {
+			mappings::CHROMATIC_OFF_DPAD_DOWN, mappings::CHROMATIC_OFF_DPAD_RIGHT,
+			mappings::CHROMATIC_OFF_DPAD_LEFT, mappings::CHROMATIC_OFF_DPAD_UP,
+			mappings::CHROMATIC_OFF_A, mappings::CHROMATIC_OFF_B,
+			mappings::CHROMATIC_OFF_X, mappings::CHROMATIC_OFF_Y,
+			mappings::CHROMATIC_OFF_VIEW, mappings::CHROMATIC_OFF_MENU,
+			mappings::CHROMATIC_OFF_L4, mappings::CHROMATIC_OFF_R4,
+			mappings::CHROMATIC_OFF_L5, mappings::CHROMATIC_OFF_R5,
+			mappings::CHROMATIC_OFF_LB, mappings::CHROMATIC_OFF_RB,
+		};
+		return OFFSET[button];
+	}
+
+	static int compute_offset_diatonic(const sc::SCState& s)
 	{
 		int offset = 0;
 		if (s.lb) offset += mappings::MOD_LB;
@@ -228,9 +394,30 @@ private:
 		return s.lb || s.rb || s.l4 || s.r4 || s.l5 || s.r5;
 	}
 
-	int effective_note(int button) const
+	// AccY tilt drives note velocity. Flat / tilted down = max velocity, tilted
+	// up (positive AccY beyond deadzone) reduces velocity proportionally.
+	static int compute_velocity(const sc::SCState& s)
 	{
-		static constexpr int BASE[NUM_BUTTONS] = {
+		if constexpr (!mappings::ENABLE_ACCY_VELOCITY)
+		{
+			return mappings::NOTE_VELOCITY;
+		}
+		int ay = s.accel_y;
+		if (ay < mappings::ACCY_VELOCITY_DEADZONE)
+			return mappings::VELOCITY_MAX;
+		float t = static_cast<float>(ay - mappings::ACCY_VELOCITY_DEADZONE)
+			/ static_cast<float>(mappings::ACCY_VELOCITY_MAX_RAW - mappings::ACCY_VELOCITY_DEADZONE);
+		if (t > 1.0f) t = 1.0f;
+		int span = mappings::VELOCITY_MAX - mappings::VELOCITY_MIN;
+		int v = mappings::VELOCITY_MAX - static_cast<int>(std::round(t * span));
+		if (v < mappings::VELOCITY_MIN) v = mappings::VELOCITY_MIN;
+		if (v > mappings::VELOCITY_MAX) v = mappings::VELOCITY_MAX;
+		return v;
+	}
+
+	int effective_note_diatonic(int button) const
+	{
+		static constexpr int BASE[8] = {
 			mappings::NOTE_DPAD_DOWN, mappings::NOTE_DPAD_RIGHT,
 			mappings::NOTE_DPAD_LEFT, mappings::NOTE_DPAD_UP,
 			mappings::NOTE_A, mappings::NOTE_B,
@@ -240,23 +427,40 @@ private:
 	}
 
 	MidiEmitter& m_m;
-	int m_offset = 0;
-	int m_active[NUM_BUTTONS] = { -1, -1, -1, -1, -1, -1, -1, -1 };
+	mappings::NoteLayout m_layout;
+	int m_offset = 0;            // DIATONIC: momentary modifier sum
+	int m_root;                  // CHROMATIC: persistent root (drifts with each press)
+	int m_home_root = mappings::CHROMATIC_DEFAULT_ROOT; // L3/R3 snap target
+	int m_alt_root = mappings::CHROMATIC_DEFAULT_ALT_ROOT;
+	bool m_at_alt = false;       // CHROMATIC: which side of the QAM toggle we're on
+	int m_active[NUM_BUTTONS] = { -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 };
+	int m_mono_note = -1;        // CHROMATIC: the single currently-playing note
+	int m_current_velocity = mappings::NOTE_VELOCITY; // recomputed each frame from AccY
+	struct PressInfo { int button; bool primary; };
+	PressInfo m_press_stack[NUM_BUTTONS] = {};
+	int m_stack_count = 0;
 };
 
 static void emit_state(MidiEmitter& m, const sc::SCState& s)
 {
 	using namespace mappings;
 
-	// Sticks + trackpads (Surge XT macros 1-8 by default)
+	// Sticks always send live values (they spring back to center). Trackpads
+	// gate on capacitive touch so the CC freezes at the last value on release.
 	m.send_bipolar(CC_LSX, s.lstick_x);
 	m.send_bipolar(CC_LSY, s.lstick_y);
 	m.send_bipolar(CC_RSX, s.rstick_x);
 	m.send_bipolar(CC_RSY, s.rstick_y);
-	m.send_bipolar(CC_LPX, s.lpad_x);
-	m.send_bipolar(CC_LPY, s.lpad_y);
-	m.send_bipolar(CC_RPX, s.rpad_x);
-	m.send_bipolar(CC_RPY, s.rpad_y);
+	if (!FREEZE_TRACKPADS_ON_RELEASE || s.lpad_touch)
+	{
+		m.send_bipolar(CC_LPX, s.lpad_x);
+		m.send_bipolar(CC_LPY, s.lpad_y);
+	}
+	if (!FREEZE_TRACKPADS_ON_RELEASE || s.rpad_touch)
+	{
+		m.send_bipolar(CC_RPX, s.rpad_x);
+		m.send_bipolar(CC_RPY, s.rpad_y);
+	}
 
 	// Triggers
 	m.send_unipolar(CC_LTRIGGER, s.ltrigger);
@@ -322,8 +526,10 @@ static void emit_state(MidiEmitter& m, const sc::SCState& s)
 	m.send_bipolar(CC_ACCEL_Z, boost(s.accel_z));
 
 	// Triton-specific clicks/touches/paddles/QAM
-	m.send_unipolar(CC_LPAD_PRESSURE, s.lpad_pressure);
-	m.send_unipolar(CC_RPAD_PRESSURE, s.rpad_pressure);
+	if (!FREEZE_TRACKPADS_ON_RELEASE || s.lpad_touch)
+		m.send_unipolar(CC_LPAD_PRESSURE, s.lpad_pressure);
+	if (!FREEZE_TRACKPADS_ON_RELEASE || s.rpad_touch)
+		m.send_unipolar(CC_RPAD_PRESSURE, s.rpad_pressure);
 	m.send_button(CC_LPAD_CLICK, s.lpad_click);
 	m.send_button(CC_RPAD_CLICK, s.rpad_click);
 	m.send_button(CC_LPAD_TOUCH, s.lpad_touch);
@@ -444,20 +650,35 @@ static void redraw(const sc::SCState& s, const MidiEmitter& m, const NoteEmitter
 		<< " L4:" << on_off(s.l4) << "L5:" << on_off(s.l5)
 		<< " R4:" << on_off(s.r4) << "R5:" << on_off(s.r5) << "\033[K\n";
 	{
-		os << "  Notes:    offset=" << std::showpos << n.total_offset() << std::noshowpos
-			<< " semis  active=[";
-		bool ffirst = true;
-		for (int i = 0; i < NoteEmitter::NUM_BUTTONS; ++i)
+		bool diatonic = (n.layout() == mappings::NoteLayout::DIATONIC);
+		os << "  Notes:    mode=" << (diatonic ? "DIATONIC " : "CHROMATIC")
+			<< " (press 1 or 2)  ";
+		if (diatonic)
 		{
-			int an = n.active_note(i);
-			if (an >= 0)
+			os << "offset=" << std::showpos << n.total_offset() << std::noshowpos << " semis";
+			os << "  active=[";
+			bool ffirst = true;
+			for (int i = 0; i < NoteEmitter::NUM_BUTTONS; ++i)
 			{
-				if (!ffirst) os << " ";
-				os << an;
-				ffirst = false;
+				int an = n.active_note(i);
+				if (an >= 0)
+				{
+					if (!ffirst) os << " ";
+					os << an;
+					ffirst = false;
+				}
 			}
+			os << "]";
 		}
-		os << "]\033[K\n";
+		else
+		{
+			os << "root=" << n.root() << " home=" << n.home_root()
+				<< " alt=" << n.alt_root() << " vel=" << n.current_velocity()
+				<< " playing=";
+			if (n.mono_note() >= 0) os << n.mono_note();
+			else os << "-";
+		}
+		os << "\033[K\n";
 	}
 	os << "  Last MIDI: ";
 	if (m.last_cc() >= 0)
@@ -545,6 +766,14 @@ int main()
 		if (!sc::parse_triton_report(r->bytes.data(), r->bytes.size(), state))
 		{
 			continue;
+		}
+
+		// Keyboard mode switching: focus the console and press 1 or 2.
+		while (_kbhit())
+		{
+			int c = _getch();
+			if (c == '1') notes.set_layout(mappings::NoteLayout::DIATONIC);
+			else if (c == '2') notes.set_layout(mappings::NoteLayout::CHROMATIC);
 		}
 
 		emit_state(emitter, state);
