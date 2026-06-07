@@ -149,6 +149,7 @@ enum class NoteLayout
 	CHROMATIC,  // Mode 2: chromatic intervals from movable root (mono, drift)
 	SCALE,      // Mode 3: fixed scale-degree notes, switchable scale (polyphonic)
 	CHORD,      // Mode 4: each button plays a diatonic triad on its scale degree
+	LSDJ,       // Mode 5: tracker-style. A starts a note, shifters move root + retrigger
 };
 
 constexpr NoteLayout DEFAULT_NOTE_LAYOUT = NoteLayout::DIATONIC;
@@ -165,6 +166,12 @@ constexpr int ACCY_VELOCITY_DEADZONE = 3000;  // raw |AccY| below this = max vel
 constexpr int ACCY_VELOCITY_MAX_RAW = 12000;  // raw AccY where velocity bottoms out (lower = steeper)
 constexpr int VELOCITY_MIN = 1;               // 0 would be a note-off, so floor at 1
 constexpr int VELOCITY_MAX = 127;
+
+// AccY also drives MIDI Expression (CC 11) - continuous, unlike velocity which
+// only fires on note_on. Same shape: flat/down = full (127), tilted up =
+// reduced. Set ENABLE_ACCY_EXPRESSION to false to disable.
+constexpr bool ENABLE_ACCY_EXPRESSION = true;
+constexpr uint8_t CC_EXPRESSION = 11; // standard MIDI Expression CC
 
 // Set to false to disable note emission entirely (buttons still send their
 // digital CCs from the CC ASSIGNMENTS section above).
@@ -355,5 +362,32 @@ constexpr CompChord COMP_CHORDS[16] = {
 	{ "iii7",    2, 4, { 0, 2, 4, 6 } },     // 14: LB - iii 7th
 	{ "Imaj9",   0, 5, { 0, 2, 4, 6, 8 } },  // 15: RB - tonic 9 (extended I)
 };
+
+// ----------------------------------------------------------------------------
+// LSDJ (Mode 5)
+// ----------------------------------------------------------------------------
+// Tracker-style monophonic playback. A starts a note at the current root.
+// Each shifter press shifts the root by its offset AND retriggers the note
+// at the new pitch. Notes latch (no auto-release) - they only stop when
+// another note replaces them or L3/R3 resets root + stops.
+
+constexpr int LSDJ_DEFAULT_ROOT = 60; // C4
+
+constexpr int LSDJ_OFF_DPAD_LEFT  = -1;
+constexpr int LSDJ_OFF_DPAD_RIGHT = +1;
+constexpr int LSDJ_OFF_DPAD_DOWN  = -2;
+constexpr int LSDJ_OFF_DPAD_UP    = +2;
+constexpr int LSDJ_OFF_X          = -3;
+constexpr int LSDJ_OFF_B          = +3;
+constexpr int LSDJ_OFF_LB         = -4;
+constexpr int LSDJ_OFF_RB         = +4;
+constexpr int LSDJ_OFF_L4         = -5;
+constexpr int LSDJ_OFF_R4         = +5;
+constexpr int LSDJ_OFF_L5         = -6;
+constexpr int LSDJ_OFF_R5         = +6;
+constexpr int LSDJ_OFF_MENU       = -12; // Select - octave down
+constexpr int LSDJ_OFF_VIEW       = +12; // Start  - octave up
+// Y is currently unused in LSDJ; assign a value here + add it to the shifters
+// array in update_lsdj() if you want it.
 
 } // namespace mappings

@@ -255,6 +255,9 @@ public:
 	int scale_index() const { return m_scale_index; }
 	const char* scale_name() const { return mappings::SCALES[m_scale_index].name; }
 	bool chord_root_mode() const { return m_chord_root_mode; }
+	int lsdj_root() const { return m_lsdj_root; }
+	int lsdj_note() const { return m_lsdj_note; }
+	bool lsdj_qam_mode() const { return m_lsdj_qam_mode; }
 	int active_note(int btn) const { return (btn >= 0 && btn < NUM_BUTTONS) ? m_active[btn] : -1; }
 
 	void update(const sc::SCState& cur, const sc::SCState& prev)
@@ -281,8 +284,10 @@ public:
 			update_chromatic(cur, prev, now, was);
 		else if (m_layout == mappings::NoteLayout::SCALE)
 			update_scale(cur, prev, now, was);
-		else
+		else if (m_layout == mappings::NoteLayout::CHORD)
 			update_chord(cur, prev);
+		else
+			update_lsdj(cur, prev);
 	}
 
 private:
@@ -312,6 +317,12 @@ private:
 				m_chord_notes[i][v] = -1;
 			}
 			m_chord_voice_count[i] = 0;
+		}
+		// LSDJ note
+		if (m_lsdj_note >= 0)
+		{
+			m_m.send_note_off(static_cast<uint8_t>(m_lsdj_note));
+			m_lsdj_note = -1;
 		}
 	}
 
@@ -644,6 +655,146 @@ private:
 		return OFFSET[button];
 	}
 
+	// === LSDJ: tracker-ish monophonic. Two sub-modes toggled by QAM.
+	//   QAM off (default): hold A = note sounds at current root. While A is
+	//     held, shifters retrigger at new root. Without A, shifters silently
+	//     move root (so you can pre-tune before pressing A).
+	//   QAM on (every-press plays): each shifter press both moves root AND
+	//     fires a note. Releasing the most-recently-pressed button stops it.
+	// L3/R3 always reset root + stop note.
+	void update_lsdj(const sc::SCState& cur, const sc::SCState& prev)
+	{
+		// QAM toggle: cleanly end any held note across the transition.
+		if (cur.qam && !prev.qam)
+		{
+			m_lsdj_qam_mode = !m_lsdj_qam_mode;
+			if (m_lsdj_note >= 0)
+			{
+				m_m.send_note_off(static_cast<uint8_t>(m_lsdj_note));
+				m_lsdj_note = -1;
+			}
+			m_lsdj_active = -1;
+		}
+
+		// Reset (L3/R3)
+		bool reset = (cur.l3 && !prev.l3) || (cur.r3 && !prev.r3);
+		if (reset)
+		{
+			if (m_lsdj_note >= 0) m_m.send_note_off(static_cast<uint8_t>(m_lsdj_note));
+			m_lsdj_note = -1;
+			m_lsdj_active = -1;
+			m_lsdj_root = mappings::LSDJ_DEFAULT_ROOT;
+		}
+
+		// Shifter table: now-pressed, was-pressed, offset, and a per-button id
+		// used to track ownership of the currently-playing note in QAM mode.
+		struct Shifter { bool now; bool was; int offset; int id; };
+		const Shifter shifters[] = {
+			{ cur.dpad_left,  prev.dpad_left,  mappings::LSDJ_OFF_DPAD_LEFT,  1 },
+			{ cur.dpad_right, prev.dpad_right, mappings::LSDJ_OFF_DPAD_RIGHT, 2 },
+			{ cur.dpad_down,  prev.dpad_down,  mappings::LSDJ_OFF_DPAD_DOWN,  3 },
+			{ cur.dpad_up,    prev.dpad_up,    mappings::LSDJ_OFF_DPAD_UP,    4 },
+			{ cur.x,          prev.x,          mappings::LSDJ_OFF_X,          5 },
+			{ cur.b,          prev.b,          mappings::LSDJ_OFF_B,          6 },
+			{ cur.lb,         prev.lb,         mappings::LSDJ_OFF_LB,         7 },
+			{ cur.rb,         prev.rb,         mappings::LSDJ_OFF_RB,         8 },
+			{ cur.l4,         prev.l4,         mappings::LSDJ_OFF_L4,         9 },
+			{ cur.r4,         prev.r4,         mappings::LSDJ_OFF_R4,        10 },
+			{ cur.l5,         prev.l5,         mappings::LSDJ_OFF_L5,        11 },
+			{ cur.r5,         prev.r5,         mappings::LSDJ_OFF_R5,        12 },
+			{ cur.menu,       prev.menu,       mappings::LSDJ_OFF_MENU,      13 },
+			{ cur.view,       prev.view,       mappings::LSDJ_OFF_VIEW,      14 },
+		};
+
+		int total_shift = 0;
+		int last_pressed_shifter_id = -1;
+		for (const auto& s : shifters)
+		{
+			if (s.now && !s.was)
+			{
+				total_shift += s.offset;
+				last_pressed_shifter_id = s.id;
+			}
+		}
+		bool shifter_pressed = (last_pressed_shifter_id != -1);
+		if (shifter_pressed)
+			m_lsdj_root = clamp_midi(m_lsdj_root + total_shift);
+
+		bool a_press = cur.a && !prev.a;
+		bool a_release = !cur.a && prev.a;
+
+		if (!m_lsdj_qam_mode)
+		{
+			// === Default sub-mode: only A triggers notes ===
+			if (a_press)
+			{
+				if (m_lsdj_note >= 0) m_m.send_note_off(static_cast<uint8_t>(m_lsdj_note));
+				m_lsdj_note = m_lsdj_root;
+				m_m.send_note_on(static_cast<uint8_t>(m_lsdj_note), static_cast<uint8_t>(m_current_velocity));
+			}
+			else if (a_release && m_lsdj_note >= 0)
+			{
+				m_m.send_note_off(static_cast<uint8_t>(m_lsdj_note));
+				m_lsdj_note = -1;
+			}
+			else if (shifter_pressed && cur.a && m_lsdj_note >= 0)
+			{
+				m_m.send_note_off(static_cast<uint8_t>(m_lsdj_note));
+				m_lsdj_note = m_lsdj_root;
+				m_m.send_note_on(static_cast<uint8_t>(m_lsdj_note), static_cast<uint8_t>(m_current_velocity));
+			}
+		}
+		else
+		{
+			// === QAM-on sub-mode: every press plays. Release of the active
+			// button stops the note - UNLESS A is held, in which case A acts
+			// as a legato sustain (note keeps ringing through shifter releases
+			// until A itself is released).
+			int newly_active = -1; // 0 = A, 1..14 = shifters
+			if (a_press) newly_active = 0;
+			if (shifter_pressed) newly_active = last_pressed_shifter_id;
+			if (newly_active != -1)
+			{
+				if (m_lsdj_note >= 0) m_m.send_note_off(static_cast<uint8_t>(m_lsdj_note));
+				m_lsdj_note = m_lsdj_root;
+				m_m.send_note_on(static_cast<uint8_t>(m_lsdj_note), static_cast<uint8_t>(m_current_velocity));
+				m_lsdj_active = newly_active;
+			}
+
+			if (a_release && m_lsdj_note >= 0)
+			{
+				// A release always stops the note (even if a shifter is also held).
+				m_m.send_note_off(static_cast<uint8_t>(m_lsdj_note));
+				m_lsdj_note = -1;
+				m_lsdj_active = -1;
+			}
+			else
+			{
+				// Shifter release: stop note unless A is held (legato sustain).
+				for (const auto& s : shifters)
+				{
+					if (!s.now && s.was && s.id == m_lsdj_active)
+					{
+						if (cur.a)
+						{
+							// A is held - sustain. Note keeps ringing; A
+							// takes over as the active button so its release
+							// is what eventually stops the note.
+							m_lsdj_active = 0;
+						}
+						else if (m_lsdj_note >= 0)
+						{
+							m_m.send_note_off(static_cast<uint8_t>(m_lsdj_note));
+							m_lsdj_note = -1;
+							m_lsdj_active = -1;
+						}
+						break;
+					}
+				}
+			}
+		}
+	}
+
 	void stack_push(int btn, bool primary)
 	{
 		if (m_stack_count < NUM_BUTTONS) m_press_stack[m_stack_count++] = { btn, primary };
@@ -751,6 +902,12 @@ private:
 	int m_chord_notes[NUM_BUTTONS][mappings::CHORD_MAX_VOICES] = {};
 	int m_chord_voice_count[NUM_BUTTONS] = {};
 	bool m_chord_root_mode = false;
+
+	// LSDJ mode: monophonic latched playback.
+	int m_lsdj_root = mappings::LSDJ_DEFAULT_ROOT;
+	int m_lsdj_note = -1;
+	bool m_lsdj_qam_mode = false; // QAM toggles "every press plays" sub-mode
+	int m_lsdj_active = -1;       // which button (by ID) owns the current note in QAM mode
 };
 
 static void emit_state(MidiEmitter& m, const sc::SCState& s)
@@ -804,6 +961,25 @@ static void emit_state(MidiEmitter& m, const sc::SCState& s)
 			mw = static_cast<uint8_t>(std::round(scaled * 127.0f));
 		}
 		m.send(CC_MOD_WHEEL, mw);
+	}
+
+	// AccY tilt -> Expression (CC 11). Continuous version of the velocity
+	// mapping: flat/down = 127, tilted up past the deadzone reduces toward 0.
+	if constexpr (ENABLE_ACCY_EXPRESSION)
+	{
+		int ay = s.accel_y;
+		uint8_t expr = 127;
+		if (ay >= ACCY_VELOCITY_DEADZONE)
+		{
+			float t = static_cast<float>(ay - ACCY_VELOCITY_DEADZONE)
+				/ static_cast<float>(ACCY_VELOCITY_MAX_RAW - ACCY_VELOCITY_DEADZONE);
+			if (t < 0.0f) t = 0.0f;
+			if (t > 1.0f) t = 1.0f;
+			int v = 127 - static_cast<int>(std::round(t * 127.0f));
+			if (v < 0) v = 0;
+			expr = static_cast<uint8_t>(v);
+		}
+		m.send(CC_EXPRESSION, expr);
 	}
 
 	// Face / system buttons
@@ -967,8 +1143,9 @@ static void redraw(const sc::SCState& s, const MidiEmitter& m, const NoteEmitter
 			layout == mappings::NoteLayout::DIATONIC  ? "DIATONIC " :
 			layout == mappings::NoteLayout::CHROMATIC ? "CHROMATIC" :
 			layout == mappings::NoteLayout::SCALE     ? "SCALE    " :
-			                                            "CHORD    ";
-		os << "  Notes:    mode=" << mode_name << " (press 1/2/3/4)  ";
+			layout == mappings::NoteLayout::CHORD     ? "CHORD    " :
+			                                            "LSDJ     ";
+		os << "  Notes:    mode=" << mode_name << " (press 1-5)  ";
 		if (layout == mappings::NoteLayout::DIATONIC)
 		{
 			os << "offset=" << std::showpos << n.total_offset() << std::noshowpos << " semis";
@@ -993,6 +1170,18 @@ static void redraw(const sc::SCState& s, const MidiEmitter& m, const NoteEmitter
 				<< " playing=";
 			if (n.mono_note() >= 0) os << n.mono_note();
 			else os << "-";
+		}
+		else if (layout == mappings::NoteLayout::LSDJ)
+		{
+			os << "root=" << n.lsdj_root()
+				<< " vel=" << n.current_velocity()
+				<< " playing=";
+			if (n.lsdj_note() >= 0) os << n.lsdj_note();
+			else os << "-";
+			os << (n.lsdj_qam_mode()
+				? "  EVERY-PRESS (QAM)"
+				: "  hold-A");
+			os << "  L3/R3=reset";
 		}
 		else
 		{
@@ -1101,7 +1290,7 @@ int main()
 			continue;
 		}
 
-		// Keyboard mode switching: focus the console and press 1, 2, 3, or 4.
+		// Keyboard mode switching: focus the console and press 1-5.
 		int c;
 		while (platform::poll_key(c))
 		{
@@ -1109,6 +1298,7 @@ int main()
 			else if (c == '2') notes.set_layout(mappings::NoteLayout::CHROMATIC);
 			else if (c == '3') notes.set_layout(mappings::NoteLayout::SCALE);
 			else if (c == '4') notes.set_layout(mappings::NoteLayout::CHORD);
+			else if (c == '5') notes.set_layout(mappings::NoteLayout::LSDJ);
 		}
 
 		emit_state(emitter, state);
