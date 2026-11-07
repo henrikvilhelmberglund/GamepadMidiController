@@ -65,7 +65,7 @@ On **macOS** you may be prompted to grant Input Monitoring permission on first r
 1. Close Steam.
 2. Plug in the Puck dongle, power on the controller.
 3. Create / enable a virtual MIDI port (see Requirements above for OS-specific tooling).
-4. Run the exe. Pick the virtual MIDI port from the list when prompted.
+4. Run the exe. Pick the virtual MIDI port from the list when prompted. If Steam is still running or the controller is asleep, it shows what's wrong and waits (Q to quit) instead of exiting. The dashboard also flags when the controller stops sending input mid-session.
 5. In your DAW: enable the virtual port as an input, arm a track, and play.
 
 Dashboard shows every input live: stick/pad positions, gyro/accel, button states, mod wheel value, velocity, current scale and chord-mode state.
@@ -89,6 +89,23 @@ Polyphonic. Each button plays a chord. Two sub-modes:
 - **Palette (QAM toggled on)**: a curated composition palette of functional chords (I/V/IV/vi on the face buttons, ii/iii/V7/vii° on the d-pad, sevenths and suspensions in the extras). In palette mode, `L3`/`R3` shifts the key by perfect fifths (circle-of-fifths style).
 
 In both sub-modes, `L3`/`R3` (default sub-mode) cycles scale, and the chord qualities adapt automatically.
+
+## DAW mode (transport control)
+
+Press `D` in the console to toggle. It is an overlay on top of whichever note mode is active, so you can keep playing and still control the transport. Default bindings:
+
+| Button | Action |
+|--------|--------|
+| Left trackpad click  | Record |
+| Right trackpad click | Stop |
+
+While DAW mode is on, bound buttons send transport commands *instead of* their normal CC / note. Each press is sent as:
+- **MMC** (MIDI Machine Control) SysEx: Play / Stop / Record strobe / Pause / Rewind / FFwd / Locate-to-start. Enable MMC / control-message input for the port in your DAW (e.g. Reaper: Preferences → MIDI Devices → input → "Enable input for control messages").
+- **A dedicated CC** per action (127 on press, 0 on release) for DAWs that ignore MMC (Ableton, Bitwig, FL): MIDI-learn the transport button to it. Defaults: Play 85, Stop 86, Record 87, Pause 89, Rewind 90, FFwd 119, Go-to-start 3.
+
+**MIDI-learning the transport CCs:** press `L` first. Learn mode mutes every continuous/ambient CC (sticks, pads, triggers, gyro, accel, tilt, pad pressure, capacitive touch) so the DAW's learn only sees the button you press. Press `L` again when done.
+
+Add more bindings or change the defaults in the `TRANSPORT_BINDINGS` table in [mappings.h](GamepadMidiController/mappings.h).
 
 ## MIDI output (default)
 

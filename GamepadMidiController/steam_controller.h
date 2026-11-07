@@ -142,8 +142,9 @@ public:
 	SteamController& operator=(const SteamController&) = delete;
 
 	// Enumerate Valve HID devices and open the first SC gamepad interface.
-	// Returns false on no-device-found or open failure.
-	bool open_first();
+	// Returns false on no-device-found or open failure. `verbose` prints one
+	// line per slot probed (turn off when retrying in a loop).
+	bool open_first(bool verbose = true);
 
 	// Print every Valve HID interface to stdout (for diagnosing why open_first
 	// can't find the gamepad interface).

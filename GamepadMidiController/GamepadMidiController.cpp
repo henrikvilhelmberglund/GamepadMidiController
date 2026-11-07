@@ -13,11 +13,15 @@
 
 #ifdef _WIN32
 #include <Windows.h>
+#include <TlHelp32.h>
 #include <conio.h>
 #else
 #include <termios.h>
 #include <unistd.h>
 #include <sys/select.h>
+#include <cctype>
+#include <filesystem>
+#include <fstream>
 #endif
 
 namespace platform
@@ -41,6 +45,39 @@ namespace platform
 	{
 		if (_kbhit()) { out_key = _getch(); return true; }
 		return false;
+	}
+
+	// Steam grabs the controller's HID device exclusively, so we can't use it
+	// while steam.exe is alive.
+	inline bool is_steam_running()
+	{
+		HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+		if (snap == INVALID_HANDLE_VALUE) return false;
+		PROCESSENTRY32W pe{};
+		pe.dwSize = sizeof(pe);
+		bool found = false;
+		if (Process32FirstW(snap, &pe))
+		{
+			do
+			{
+				if (_wcsicmp(pe.szExeFile, L"steam.exe") == 0) { found = true; break; }
+			} while (Process32NextW(snap, &pe));
+		}
+		CloseHandle(snap);
+		return found;
+	}
+
+	// When launched by double-clicking the exe, the console window belongs to
+	// us alone and vanishes on exit - so wait for a key before closing it, or
+	// the error message is unreadable.
+	inline void pause_before_exit()
+	{
+		DWORD ids[2];
+		if (GetConsoleProcessList(ids, 2) <= 1)
+		{
+			std::cout << "\nPress any key to exit..." << std::flush;
+			(void)_getch();
+		}
 	}
 
 #else // POSIX: raw stdin via termios + non-blocking poll via select()
@@ -87,6 +124,30 @@ namespace platform
 		}
 		return false;
 	}
+
+	inline bool is_steam_running()
+	{
+#ifdef __linux__
+		try
+		{
+			namespace fs = std::filesystem;
+			for (const auto& e : fs::directory_iterator("/proc"))
+			{
+				const std::string pid = e.path().filename().string();
+				if (pid.empty() || !std::isdigit(static_cast<unsigned char>(pid[0]))) continue;
+				std::ifstream f(e.path() / "comm");
+				std::string comm;
+				if (std::getline(f, comm) && comm == "steam") return true;
+			}
+		}
+		catch (...) {}
+		return false;
+#else
+		return std::system("pgrep -xq steam_osx") == 0;
+#endif
+	}
+
+	inline void pause_before_exit() {} // terminal stays open on POSIX
 
 #endif
 
@@ -139,6 +200,45 @@ static std::optional<libremidi::output_port> select_midi_out_port()
 	}
 }
 
+// Block until Steam is closed and a controller answers on the receiver,
+// showing a one-line status meanwhile. Returns false if the user quits (Q/Esc).
+static bool wait_for_controller(sc::SteamController& controller)
+{
+	static constexpr char SPINNER[] = "|/-\\";
+	int spin = 0;
+	bool waited = false;
+	while (true)
+	{
+		bool steam = platform::is_steam_running();
+		if (!steam && controller.open_first(false))
+		{
+			if (waited) std::cout << "\r\033[K";
+			return true;
+		}
+		waited = true;
+
+		std::cout << "\r\033[K" << SPINNER[spin++ % 4] << ' '
+			<< (steam
+				? "Steam is running. Quit it (tray icon > Exit) to free the controller."
+				: "Waiting for controller. Turn it on or press a button to wake it.")
+			<< "  Q = quit" << std::flush;
+
+		for (int i = 0; i < 10; ++i) // ~500 ms between attempts, keys stay responsive
+		{
+			int c;
+			while (platform::poll_key(c))
+			{
+				if (c == 'q' || c == 'Q' || c == 27)
+				{
+					std::cout << '\n';
+					return false;
+				}
+			}
+			std::this_thread::sleep_for(std::chrono::milliseconds(50));
+		}
+	}
+}
+
 class MidiEmitter
 {
 public:
@@ -162,17 +262,29 @@ public:
 	void send_bipolar(uint8_t cc, int16_t value)
 	{
 		float normalized = (static_cast<float>(value) + 32768.0f) / 65535.0f;
-		if (normalized < 0.0f) normalized = 0.0f;
-		if (normalized > 1.0f) normalized = 1.0f;
-		send(cc, static_cast<uint8_t>(std::round(normalized * 127.0f)));
+		send_continuous(cc, normalized * 127.0f);
 	}
 
 	void send_unipolar(uint8_t cc, int16_t value)
 	{
 		if (value < 0) value = 0;
 		float normalized = static_cast<float>(value) / 32767.0f;
-		if (normalized > 1.0f) normalized = 1.0f;
-		send(cc, static_cast<uint8_t>(std::round(normalized * 127.0f)));
+		send_continuous(cc, normalized * 127.0f);
+	}
+
+	// `v` is the unrounded 0..127 value. Hysteresis: only move to a new CC
+	// value once the input is clearly past the rounding midpoint. Without it,
+	// a resting sensor sitting on a boundary (gyro/accel/sticks at rest map to
+	// exactly 63.5) flickers 63/64 forever, flooding the DAW and breaking
+	// MIDI learn.
+	void send_continuous(uint8_t cc, float v)
+	{
+		if (cc >= 128) return;
+		if (v < 0.0f) v = 0.0f;
+		if (v > 127.0f) v = 127.0f;
+		int last = m_last[cc];
+		if (last >= 0 && std::fabs(v - static_cast<float>(last)) < CONTINUOUS_HYSTERESIS) return;
+		send(cc, static_cast<uint8_t>(std::round(v)));
 	}
 
 	// Pitch bend: 14-bit value 0..16383, center 8192. Dedup so we don't spam.
@@ -194,12 +306,19 @@ public:
 		m_midi.send_message(libremidi::channel_events::note_off(m_channel, note, 0));
 	}
 
+	void send_sysex(const unsigned char* data, size_t size)
+	{
+		m_midi.send_message(data, size);
+	}
+
 	int last_cc() const { return m_last_cc; }
 	int last_value() const { return m_last_value; }
 	int value_for(uint8_t cc) const { return cc < 128 ? m_last[cc] : -1; }
 	int last_pitch_bend() const { return m_last_pitch_bend; }
 
 private:
+	static constexpr float CONTINUOUS_HYSTERESIS = 0.75f; // in CC steps (0.5 = none)
+
 	libremidi::midi_out& m_midi;
 	uint8_t m_channel;
 	int16_t m_last[128];
@@ -910,7 +1029,207 @@ private:
 	int m_lsdj_active = -1;       // which button (by ID) owns the current note in QAM mode
 };
 
-static void emit_state(MidiEmitter& m, const sc::SCState& s)
+// DAW mode: maps buttons to transport commands (MMC SysEx and/or dedicated
+// CCs). Toggled with 'D' in the console. While enabled, bound buttons are
+// masked out of the state that feeds the regular CC + note emitters.
+class TransportEmitter
+{
+public:
+	explicit TransportEmitter(MidiEmitter& m) : m_m(m) {}
+
+	bool enabled() const { return m_enabled; }
+	mappings::TransportAction last_action() const { return m_last_action; }
+
+	void toggle()
+	{
+		m_enabled = !m_enabled;
+		if (!m_enabled && mappings::TRANSPORT_SEND_CC)
+		{
+			// Don't leave a transport CC stuck at 127 if a bound button was
+			// held while DAW mode was switched off.
+			for (const auto& b : mappings::TRANSPORT_BINDINGS)
+			{
+				uint8_t cc = action_cc(b.action);
+				if (cc < 128) m_m.send_button(cc, false);
+			}
+		}
+	}
+
+	// `cur` / `prev` are the RAW (unmasked) controller states.
+	void update(const sc::SCState& cur, const sc::SCState& prev)
+	{
+		if (!m_enabled) return;
+		for (const auto& b : mappings::TRANSPORT_BINDINGS)
+		{
+			if (b.action == mappings::TransportAction::NONE) continue;
+			bool now = button(cur, b.button);
+			bool was = button(prev, b.button);
+			if (now == was) continue;
+
+			if (now)
+			{
+				if constexpr (mappings::TRANSPORT_SEND_MMC) send_mmc(b.action);
+				m_last_action = b.action;
+			}
+			if constexpr (mappings::TRANSPORT_SEND_CC)
+			{
+				uint8_t cc = action_cc(b.action);
+				if (cc < 128) m_m.send_button(cc, now);
+			}
+		}
+	}
+
+	// Clear every bound button in `s` (no-op while DAW mode is off).
+	void mask(sc::SCState& s) const
+	{
+		if (!m_enabled) return;
+		for (const auto& b : mappings::TRANSPORT_BINDINGS)
+		{
+			if (b.action != mappings::TransportAction::NONE)
+				button(s, b.button) = false;
+		}
+	}
+
+	static const char* action_name(mappings::TransportAction a)
+	{
+		using A = mappings::TransportAction;
+		switch (a)
+		{
+		case A::PLAY:         return "PLAY";
+		case A::STOP:         return "STOP";
+		case A::RECORD:       return "REC";
+		case A::PAUSE:        return "PAUSE";
+		case A::REWIND:       return "REW";
+		case A::FAST_FORWARD: return "FFWD";
+		case A::GOTO_START:   return "START";
+		default:              return "-";
+		}
+	}
+
+	static const char* button_name(mappings::TransportButton b)
+	{
+		using B = mappings::TransportButton;
+		switch (b)
+		{
+		case B::LPAD_CLICK:  return "LPad";
+		case B::RPAD_CLICK:  return "RPad";
+		case B::A:           return "A";
+		case B::B:           return "B";
+		case B::X:           return "X";
+		case B::Y:           return "Y";
+		case B::LB:          return "LB";
+		case B::RB:          return "RB";
+		case B::L3:          return "L3";
+		case B::R3:          return "R3";
+		case B::VIEW:        return "View";
+		case B::MENU:        return "Menu";
+		case B::STEAM:       return "Steam";
+		case B::QAM:         return "QAM";
+		case B::DPAD_UP:     return "DUp";
+		case B::DPAD_DOWN:   return "DDown";
+		case B::DPAD_LEFT:   return "DLeft";
+		case B::DPAD_RIGHT:  return "DRight";
+		case B::L4:          return "L4";
+		case B::L5:          return "L5";
+		case B::R4:          return "R4";
+		case B::R5:          return "R5";
+		case B::LTRIG_CLICK: return "LTrigC";
+		case B::RTRIG_CLICK: return "RTrigC";
+		}
+		return "?";
+	}
+
+private:
+	static bool& button(sc::SCState& s, mappings::TransportButton b)
+	{
+		using B = mappings::TransportButton;
+		switch (b)
+		{
+		case B::LPAD_CLICK:  return s.lpad_click;
+		case B::RPAD_CLICK:  return s.rpad_click;
+		case B::A:           return s.a;
+		case B::B:           return s.b;
+		case B::X:           return s.x;
+		case B::Y:           return s.y;
+		case B::LB:          return s.lb;
+		case B::RB:          return s.rb;
+		case B::L3:          return s.l3;
+		case B::R3:          return s.r3;
+		case B::VIEW:        return s.view;
+		case B::MENU:        return s.menu;
+		case B::STEAM:       return s.steam;
+		case B::QAM:         return s.qam;
+		case B::DPAD_UP:     return s.dpad_up;
+		case B::DPAD_DOWN:   return s.dpad_down;
+		case B::DPAD_LEFT:   return s.dpad_left;
+		case B::DPAD_RIGHT:  return s.dpad_right;
+		case B::L4:          return s.l4;
+		case B::L5:          return s.l5;
+		case B::R4:          return s.r4;
+		case B::R5:          return s.r5;
+		case B::LTRIG_CLICK: return s.ltrig_click;
+		case B::RTRIG_CLICK: return s.rtrig_click;
+		}
+		return s.lpad_click; // unreachable
+	}
+
+	static bool button(const sc::SCState& s, mappings::TransportButton b)
+	{
+		return button(const_cast<sc::SCState&>(s), b);
+	}
+
+	static uint8_t action_cc(mappings::TransportAction a)
+	{
+		using A = mappings::TransportAction;
+		switch (a)
+		{
+		case A::PLAY:         return mappings::CC_TRANSPORT_PLAY;
+		case A::STOP:         return mappings::CC_TRANSPORT_STOP;
+		case A::RECORD:       return mappings::CC_TRANSPORT_RECORD;
+		case A::PAUSE:        return mappings::CC_TRANSPORT_PAUSE;
+		case A::REWIND:       return mappings::CC_TRANSPORT_REWIND;
+		case A::FAST_FORWARD: return mappings::CC_TRANSPORT_FAST_FORWARD;
+		case A::GOTO_START:   return mappings::CC_TRANSPORT_GOTO_START;
+		default:              return 255;
+		}
+	}
+
+	void send_mmc(mappings::TransportAction a)
+	{
+		using A = mappings::TransportAction;
+		const uint8_t dev = mappings::MMC_DEVICE_ID;
+		if (a == A::GOTO_START)
+		{
+			// MMC LOCATE (target) to hh:mm:ss:ff:sf = 00:00:00:00:00
+			const unsigned char msg[] = { 0xF0, 0x7F, dev, 0x06, 0x44, 0x06, 0x01,
+				0x00, 0x00, 0x00, 0x00, 0x00, 0xF7 };
+			m_m.send_sysex(msg, sizeof(msg));
+			return;
+		}
+		uint8_t cmd = 0;
+		switch (a)
+		{
+		case A::STOP:         cmd = 0x01; break;
+		case A::PLAY:         cmd = 0x02; break;
+		case A::FAST_FORWARD: cmd = 0x04; break;
+		case A::REWIND:       cmd = 0x05; break;
+		case A::RECORD:       cmd = 0x06; break; // record strobe
+		case A::PAUSE:        cmd = 0x09; break;
+		default: return;
+		}
+		const unsigned char msg[] = { 0xF0, 0x7F, dev, 0x06, cmd, 0xF7 };
+		m_m.send_sysex(msg, sizeof(msg));
+	}
+
+	MidiEmitter& m_m;
+	bool m_enabled = mappings::DAW_MODE_DEFAULT_ON;
+	mappings::TransportAction m_last_action = mappings::TransportAction::NONE;
+};
+
+// Everything analog or ambient: sticks, pads, triggers, pitch bend, tilt,
+// gyro/accel, pad pressure and capacitive touches. These are muted in learn
+// mode, because they stream constantly and swamp a DAW's MIDI learn.
+static void emit_continuous(MidiEmitter& m, const sc::SCState& s)
 {
 	using namespace mappings;
 
@@ -982,6 +1301,38 @@ static void emit_state(MidiEmitter& m, const sc::SCState& s)
 		m.send(CC_EXPRESSION, expr);
 	}
 
+	// Gyro + accel, boosted before scaling so normal motion reaches full CC range.
+	auto boost = [](int16_t v) -> int16_t {
+		int b = static_cast<int>(v) * GYRO_ACCEL_BOOST;
+		if (b > 32767) return 32767;
+		if (b < -32768) return -32768;
+		return static_cast<int16_t>(b);
+	};
+	m.send_bipolar(CC_GYRO_X, boost(s.gyro_x));
+	m.send_bipolar(CC_GYRO_Y, boost(s.gyro_y));
+	m.send_bipolar(CC_GYRO_Z, boost(s.gyro_z));
+	m.send_bipolar(CC_ACCEL_X, boost(s.accel_x));
+	m.send_bipolar(CC_ACCEL_Y, boost(s.accel_y));
+	m.send_bipolar(CC_ACCEL_Z, boost(s.accel_z));
+
+	// Pad pressure + capacitive touches
+	if (!FREEZE_TRACKPADS_ON_RELEASE || s.lpad_touch)
+		m.send_unipolar(CC_LPAD_PRESSURE, s.lpad_pressure);
+	if (!FREEZE_TRACKPADS_ON_RELEASE || s.rpad_touch)
+		m.send_unipolar(CC_RPAD_PRESSURE, s.rpad_pressure);
+	m.send_button(CC_LPAD_TOUCH, s.lpad_touch);
+	m.send_button(CC_RPAD_TOUCH, s.rpad_touch);
+	m.send_button(CC_LGRIP_TOUCH, s.lgrip_touch);
+	m.send_button(CC_RGRIP_TOUCH, s.rgrip_touch);
+	m.send_button(CC_LSTICK_TOUCH, s.lstick_touch);
+	m.send_button(CC_RSTICK_TOUCH, s.rstick_touch);
+}
+
+// Physical button presses (127 on press, 0 on release).
+static void emit_buttons(MidiEmitter& m, const sc::SCState& s)
+{
+	using namespace mappings;
+
 	// Face / system buttons
 	m.send_button(CC_A, s.a);
 	m.send_button(CC_B, s.b);
@@ -999,33 +1350,9 @@ static void emit_state(MidiEmitter& m, const sc::SCState& s)
 	m.send_button(CC_DPAD_RIGHT, s.dpad_right);
 	m.send_button(CC_STEAM, s.steam);
 
-	// Gyro + accel, boosted before scaling so normal motion reaches full CC range.
-	auto boost = [](int16_t v) -> int16_t {
-		int b = static_cast<int>(v) * GYRO_ACCEL_BOOST;
-		if (b > 32767) return 32767;
-		if (b < -32768) return -32768;
-		return static_cast<int16_t>(b);
-	};
-	m.send_bipolar(CC_GYRO_X, boost(s.gyro_x));
-	m.send_bipolar(CC_GYRO_Y, boost(s.gyro_y));
-	m.send_bipolar(CC_GYRO_Z, boost(s.gyro_z));
-	m.send_bipolar(CC_ACCEL_X, boost(s.accel_x));
-	m.send_bipolar(CC_ACCEL_Y, boost(s.accel_y));
-	m.send_bipolar(CC_ACCEL_Z, boost(s.accel_z));
-
-	// Triton-specific clicks/touches/paddles/QAM
-	if (!FREEZE_TRACKPADS_ON_RELEASE || s.lpad_touch)
-		m.send_unipolar(CC_LPAD_PRESSURE, s.lpad_pressure);
-	if (!FREEZE_TRACKPADS_ON_RELEASE || s.rpad_touch)
-		m.send_unipolar(CC_RPAD_PRESSURE, s.rpad_pressure);
+	// Triton-specific clicks/paddles/QAM
 	m.send_button(CC_LPAD_CLICK, s.lpad_click);
 	m.send_button(CC_RPAD_CLICK, s.rpad_click);
-	m.send_button(CC_LPAD_TOUCH, s.lpad_touch);
-	m.send_button(CC_RPAD_TOUCH, s.rpad_touch);
-	m.send_button(CC_LGRIP_TOUCH, s.lgrip_touch);
-	m.send_button(CC_RGRIP_TOUCH, s.rgrip_touch);
-	m.send_button(CC_LSTICK_TOUCH, s.lstick_touch);
-	m.send_button(CC_RSTICK_TOUCH, s.rstick_touch);
 	m.send_button(CC_LTRIG_CLICK, s.ltrig_click);
 	m.send_button(CC_RTRIG_CLICK, s.rtrig_click);
 	m.send_button(CC_L4, s.l4);
@@ -1069,7 +1396,8 @@ static void render(std::ostringstream& os, const char* label, int raw, int range
 		<< "\033[K\n";
 }
 
-static void redraw(const sc::SCState& s, const MidiEmitter& m, const NoteEmitter& n)
+static void redraw(const sc::SCState& s, const MidiEmitter& m, const NoteEmitter& n,
+	const TransportEmitter& t, bool idle, bool learn)
 {
 	std::ostringstream os;
 	static bool first = true;
@@ -1200,6 +1528,20 @@ static void redraw(const sc::SCState& s, const MidiEmitter& m, const NoteEmitter
 		}
 		os << "\033[K\n";
 	}
+	os << "  DAW:      " << (t.enabled() ? "ON " : "OFF") << " (press D)  ";
+	for (const auto& b : mappings::TRANSPORT_BINDINGS)
+	{
+		if (b.action == mappings::TransportAction::NONE) continue;
+		os << TransportEmitter::button_name(b.button) << "="
+			<< TransportEmitter::action_name(b.action) << " ";
+	}
+	os << " last=" << TransportEmitter::action_name(t.last_action()) << "\033[K\n";
+	os << "  Learn:    "
+		<< (learn ? "\033[36mON  - continuous CCs muted, only buttons are sent\033[0m" : "OFF")
+		<< " (press L)\033[K\n";
+	os << "  Controller: "
+		<< (idle ? "\033[33mNO INPUT - asleep or off? Press a button to wake it.\033[0m" : "connected")
+		<< "\033[K\n";
 	os << "  Last MIDI: ";
 	if (m.last_cc() >= 0)
 		os << "CC " << std::setw(3) << m.last_cc() << " = " << std::setw(3) << m.last_value();
@@ -1233,15 +1575,15 @@ int main()
 	if (hid_init() != 0)
 	{
 		std::cerr << "hid_init() failed\n";
+		platform::pause_before_exit();
 		return 1;
 	}
 
 	sc::SteamController controller;
-	if (!controller.open_first())
+	if (!wait_for_controller(controller))
 	{
-		std::cerr << "\nNo Steam Controller found. Make sure Steam is closed and the controller is on.\n";
 		hid_exit();
-		return 1;
+		return 0;
 	}
 
 	const char* kind = "unknown";
@@ -1258,6 +1600,7 @@ int main()
 	{
 		std::cerr << "Failed to disable lizard mode / enable IMU\n";
 		hid_exit();
+		platform::pause_before_exit();
 		return 1;
 	}
 
@@ -1267,12 +1610,17 @@ int main()
 
 	MidiEmitter emitter(midi, mappings::MIDI_CHANNEL);
 	NoteEmitter notes(emitter);
+	TransportEmitter transport(emitter);
 
 	auto last_lizard_refresh = std::chrono::steady_clock::now();
 	auto last_redraw = std::chrono::steady_clock::now() - std::chrono::seconds(1);
 	sc::SCState state;
-	sc::SCState prev_state;
+	sc::SCState prev_state;        // raw, for transport edge detection
+	sc::SCState prev_masked_state; // masked, for note edge detection
 	bool have_prev = false;
+	auto last_report = std::chrono::steady_clock::now();
+	bool idle = false; // no reports for a while: controller asleep / off
+	bool learn_mode = false; // 'L': mute continuous CCs so DAW MIDI learn sees only buttons
 	while (true)
 	{
 		auto now = std::chrono::steady_clock::now();
@@ -1283,14 +1631,29 @@ int main()
 		}
 
 		auto r = controller.read(100);
-		if (!r) continue;
-
-		if (!sc::parse_triton_report(r->bytes.data(), r->bytes.size(), state))
+		if (!r || !sc::parse_triton_report(r->bytes.data(), r->bytes.size(), state))
 		{
+			// The controller streams continuously while awake, so a gap means
+			// it went to sleep or was switched off.
+			now = std::chrono::steady_clock::now();
+			if (now - last_report >= std::chrono::seconds(2)) idle = true;
+			if (idle && now - last_redraw >= std::chrono::milliseconds(250))
+			{
+				redraw(prev_state, emitter, notes, transport, idle, learn_mode);
+				last_redraw = now;
+			}
 			continue;
 		}
+		last_report = now;
+		if (idle)
+		{
+			// Woke back up: it may have reconnected with default settings
+			// (lizard mode on, IMU off), so re-apply ours.
+			controller.configure_for_raw_input();
+			idle = false;
+		}
 
-		// Keyboard mode switching: focus the console and press 1-5.
+		// Keyboard mode switching: focus the console and press 1-5, D = DAW mode.
 		int c;
 		while (platform::poll_key(c))
 		{
@@ -1299,19 +1662,29 @@ int main()
 			else if (c == '3') notes.set_layout(mappings::NoteLayout::SCALE);
 			else if (c == '4') notes.set_layout(mappings::NoteLayout::CHORD);
 			else if (c == '5') notes.set_layout(mappings::NoteLayout::LSDJ);
+			else if (c == 'd' || c == 'D') transport.toggle();
+			else if (c == 'l' || c == 'L') learn_mode = !learn_mode;
 		}
 
-		emit_state(emitter, state);
+		// DAW mode: transport-bound buttons fire transport commands and are
+		// hidden from the regular CC + note paths.
+		if (have_prev) transport.update(state, prev_state);
+		sc::SCState masked = state;
+		transport.mask(masked);
+
+		if (!learn_mode) emit_continuous(emitter, masked);
+		emit_buttons(emitter, masked);
 		if constexpr (mappings::ENABLE_NOTES)
 		{
-			if (have_prev) notes.update(state, prev_state);
+			if (have_prev) notes.update(masked, prev_masked_state);
 		}
 		prev_state = state;
+		prev_masked_state = masked;
 		have_prev = true;
 
 		if (now - last_redraw >= std::chrono::milliseconds(REDRAW_INTERVAL_MS))
 		{
-			redraw(state, emitter, notes);
+			redraw(state, emitter, notes, transport, idle, learn_mode);
 			last_redraw = now;
 		}
 	}

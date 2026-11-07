@@ -124,7 +124,7 @@ void SteamController::list_valve_devices()
 	hid_free_enumeration(list);
 }
 
-bool SteamController::open_first()
+bool SteamController::open_first(bool verbose)
 {
 	// Wireless dongles ("Puck" PID 0x1304, dongle PID 0x1142) expose one
 	// gamepad collection per controller slot. Only one slot is actually paired
@@ -148,8 +148,11 @@ bool SteamController::open_first()
 		hid_device* dev = hid_open_path(it->path);
 		if (!dev) continue;
 
-		std::cout << "  trying " << it->path << " ... ";
-		std::cout.flush();
+		if (verbose)
+		{
+			std::cout << "  trying " << it->path << " ... ";
+			std::cout.flush();
+		}
 
 		// Probe: send SETTING_LIZARD_MODE=OFF with Report ID 1 (Triton/Puck protocol).
 		// Empty dongle slots reject the feature report; the paired slot accepts it.
@@ -158,13 +161,16 @@ bool SteamController::open_first()
 		int sres = retrying_send_feature(dev, probe_buf.data(), probe_buf.size());
 		if (sres < 0)
 		{
-			const wchar_t* err = hid_error(dev);
-			std::cout << "no controller on this slot (" << wide_to_utf8(err) << ")\n";
+			if (verbose)
+			{
+				const wchar_t* err = hid_error(dev);
+				std::cout << "no controller on this slot (" << wide_to_utf8(err) << ")\n";
+			}
 			hid_close(dev);
 			continue;
 		}
 
-		std::cout << "ACCEPTED (likely paired)\n";
+		if (verbose) std::cout << "ACCEPTED (likely paired)\n";
 		m_dev = dev;
 		m_path = it->path;
 		m_pid = it->product_id;

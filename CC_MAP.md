@@ -108,6 +108,20 @@ Examples: hold LB + R4 = -11 semitones (octave down, then up a semitone). Hold L
 | 117 | R5 paddle | button |
 | 118 | QAM (quick access menu) | button |
 
+## DAW mode transport — MMC + CC 3, 85-90, 119
+
+Only active while DAW mode is on (toggle with `D` in the console). Bound buttons (default: left pad click = Record, right pad click = Stop) send an MMC SysEx command plus the CC below, and stop sending their normal CC / note while DAW mode is on.
+
+| CC  | Action | MMC |
+|-----|--------|-----|
+| 85  | Play         | `F0 7F 7F 06 02 F7` |
+| 86  | Stop         | `F0 7F 7F 06 01 F7` |
+| 87  | Record       | `F0 7F 7F 06 06 F7` (record strobe) |
+| 89  | Pause        | `F0 7F 7F 06 09 F7` |
+| 90  | Rewind       | `F0 7F 7F 06 05 F7` |
+| 119 | Fast forward | `F0 7F 7F 06 04 F7` |
+| 3   | Go to start  | `F0 7F 7F 06 44 06 01 00 00 00 00 00 F7` (locate) |
+
 ## Expansion ideas
 
 1. **Modal layers / banks** — hold a paddle (L4/L5) to remap A/B/X/Y to a second bank of CCs. Doubles your knob count.

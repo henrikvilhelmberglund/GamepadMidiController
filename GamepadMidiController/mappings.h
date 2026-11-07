@@ -390,4 +390,77 @@ constexpr int LSDJ_OFF_VIEW       = +12; // Start  - octave up
 // Y is currently unused in LSDJ; assign a value here + add it to the shifters
 // array in update_lsdj() if you want it.
 
+// ----------------------------------------------------------------------------
+// DAW MODE (transport control)
+// ----------------------------------------------------------------------------
+// Overlay toggled by pressing 'D' in the console. Independent of the note
+// layout (1-5), so you can keep playing notes and hit record/stop.
+//
+// While DAW mode is ON, every button bound below sends a transport command
+// on press INSTEAD of its normal CC / note behaviour (the button is masked
+// out of the regular CC + note handling, so nothing double-fires).
+//
+// Each transport press is sent two ways (toggle either off below):
+//   * MMC (MIDI Machine Control) SysEx - understood natively by e.g. Reaper,
+//     Cubase, Logic, Studio One, Pro Tools (enable "control messages" / MMC
+//     input for the port in the DAW's MIDI preferences).
+//   * A dedicated CC per action (127 on press, 0 on release) - for DAWs that
+//     ignore MMC (Ableton Live, Bitwig, FL Studio): MIDI-learn the transport
+//     button to this CC.
+
+enum class TransportAction
+{
+	NONE,
+	PLAY,
+	STOP,
+	RECORD,        // MMC "record strobe" - punches in / starts recording
+	PAUSE,
+	REWIND,        // MMC shuttle rewind (runs until STOP/PLAY)
+	FAST_FORWARD,  // MMC shuttle fast-forward (runs until STOP/PLAY)
+	GOTO_START,    // MMC locate to 00:00:00:00
+};
+
+// Buttons that can be bound to a transport action.
+enum class TransportButton
+{
+	LPAD_CLICK, RPAD_CLICK,
+	A, B, X, Y,
+	LB, RB, L3, R3,
+	VIEW, MENU, STEAM, QAM,
+	DPAD_UP, DPAD_DOWN, DPAD_LEFT, DPAD_RIGHT,
+	L4, L5, R4, R5,
+	LTRIG_CLICK, RTRIG_CLICK,
+};
+
+struct TransportBinding
+{
+	TransportButton button;
+	TransportAction action;
+};
+
+// Add / change bindings here. A button may appear at most once.
+constexpr TransportBinding TRANSPORT_BINDINGS[] = {
+	{ TransportButton::LPAD_CLICK, TransportAction::RECORD },
+	{ TransportButton::RPAD_CLICK, TransportAction::STOP },
+	// Examples:
+	// { TransportButton::R3,     TransportAction::PLAY },
+	// { TransportButton::L3,     TransportAction::GOTO_START },
+};
+
+constexpr bool DAW_MODE_DEFAULT_ON = false;
+
+constexpr bool TRANSPORT_SEND_MMC = true;
+constexpr uint8_t MMC_DEVICE_ID = 0x7F; // 0x7F = "all call" (every device listens)
+
+constexpr bool TRANSPORT_SEND_CC = true;
+// Picked from the MIDI spec's "undefined" CCs so they don't collide with
+// anything above.
+constexpr uint8_t CC_TRANSPORT_PLAY         = 85;
+constexpr uint8_t CC_TRANSPORT_STOP         = 86;
+constexpr uint8_t CC_TRANSPORT_RECORD       = 87;
+constexpr uint8_t CC_TRANSPORT_PAUSE        = 89;
+constexpr uint8_t CC_TRANSPORT_REWIND       = 90;
+constexpr uint8_t CC_TRANSPORT_FAST_FORWARD = 119;
+constexpr uint8_t CC_TRANSPORT_GOTO_START   = 3;
+
 } // namespace mappings
