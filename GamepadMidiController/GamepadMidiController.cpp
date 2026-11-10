@@ -4,6 +4,7 @@
 
 #include <hidapi.h>
 #include <algorithm>
+#include <cctype>
 #include <csignal>
 #include <cstdlib>
 #include <iomanip>
@@ -200,6 +201,16 @@ static std::optional<libremidi::output_port> select_midi_out_port()
 	}
 }
 
+static bool icontains(const std::string& haystack, const std::string& needle)
+{
+	auto lower = [](std::string s) {
+		std::transform(s.begin(), s.end(), s.begin(),
+			[](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+		return s;
+	};
+	return lower(haystack).find(lower(needle)) != std::string::npos;
+}
+
 // Block until Steam is closed and a controller answers on the receiver,
 // showing a one-line status meanwhile. Returns false if the user quits (Q/Esc).
 static bool wait_for_controller(sc::SteamController& controller)
@@ -242,7 +253,10 @@ static bool wait_for_controller(sc::SteamController& controller)
 class MidiEmitter
 {
 public:
-	MidiEmitter(libremidi::midi_out& midi, uint8_t channel) : m_midi(midi), m_channel(channel)
+	// `channel` is 0-indexed (0 = MIDI channel 1), like everything in
+	// mappings.h. libremidi's channel_events are 1-indexed, hence the +1.
+	MidiEmitter(libremidi::midi_out& midi, uint8_t channel)
+		: m_midi(midi), m_channel(static_cast<uint8_t>(channel + 1))
 	{
 		for (auto& v : m_last) v = -1;
 	}
@@ -306,11 +320,6 @@ public:
 		m_midi.send_message(libremidi::channel_events::note_off(m_channel, note, 0));
 	}
 
-	void send_sysex(const unsigned char* data, size_t size)
-	{
-		m_midi.send_message(data, size);
-	}
-
 	int last_cc() const { return m_last_cc; }
 	int last_value() const { return m_last_value; }
 	int value_for(uint8_t cc) const { return cc < 128 ? m_last[cc] : -1; }
@@ -361,6 +370,9 @@ public:
 	}
 
 	mappings::NoteLayout layout() const { return m_layout; }
+
+	// Note-off for everything currently sounding (e.g. when entering DAW mode).
+	void panic() { release_all(); }
 	int total_offset() const { return m_offset; }
 	int root() const { return m_root; }
 	int home_root() const { return m_home_root; }
@@ -1029,86 +1041,86 @@ private:
 	int m_lsdj_active = -1;       // which button (by ID) owns the current note in QAM mode
 };
 
-// DAW mode: maps buttons to transport commands (MMC SysEx and/or dedicated
-// CCs). Toggled with 'D' in the console. While enabled, bound buttons are
-// masked out of the state that feeds the regular CC + note emitters.
-class TransportEmitter
+// DAW mode: a separate mode where buttons send DAW commands (one CC per
+// action on mappings::DAW_MIDI_CHANNEL, read by the Bitwig script in
+// bitwig/). While enabled, the regular CC + note output is off entirely.
+class DawMode
 {
 public:
-	explicit TransportEmitter(MidiEmitter& m) : m_m(m) {}
+	explicit DawMode(MidiEmitter& out) : m_out(&out) {}
 
 	bool enabled() const { return m_enabled; }
-	mappings::TransportAction last_action() const { return m_last_action; }
+	mappings::DawAction last_action() const { return m_last_action; }
 
-	void toggle()
+	// Switch where DAW commands go (e.g. once the DAW port shows up).
+	void set_output(MidiEmitter& out) { m_out = &out; }
+
+	void set_enabled(bool on)
 	{
-		m_enabled = !m_enabled;
-		if (!m_enabled && mappings::TRANSPORT_SEND_CC)
+		if (on == m_enabled) return;
+		m_enabled = on;
+		// Don't leave a DAW CC latched at 127 if a button was held.
+		for (const auto& b : mappings::DAW_BINDINGS)
 		{
-			// Don't leave a transport CC stuck at 127 if a bound button was
-			// held while DAW mode was switched off.
-			for (const auto& b : mappings::TRANSPORT_BINDINGS)
-			{
-				uint8_t cc = action_cc(b.action);
-				if (cc < 128) m_m.send_button(cc, false);
-			}
+			if (is_sent(b.action)) m_out->send_button(static_cast<uint8_t>(b.action), false);
 		}
 	}
 
-	// `cur` / `prev` are the RAW (unmasked) controller states.
-	void update(const sc::SCState& cur, const sc::SCState& prev)
+	// Returns true if the user asked to leave DAW mode (EXIT_DAW_MODE).
+	bool update(const sc::SCState& cur, const sc::SCState& prev)
 	{
-		if (!m_enabled) return;
-		for (const auto& b : mappings::TRANSPORT_BINDINGS)
+		bool exit_requested = false;
+		for (const auto& b : mappings::DAW_BINDINGS)
 		{
-			if (b.action == mappings::TransportAction::NONE) continue;
 			bool now = button(cur, b.button);
 			bool was = button(prev, b.button);
 			if (now == was) continue;
 
-			if (now)
+			if (b.action == mappings::DawAction::EXIT_DAW_MODE)
 			{
-				if constexpr (mappings::TRANSPORT_SEND_MMC) send_mmc(b.action);
-				m_last_action = b.action;
+				if (now) exit_requested = true;
+				continue;
 			}
-			if constexpr (mappings::TRANSPORT_SEND_CC)
-			{
-				uint8_t cc = action_cc(b.action);
-				if (cc < 128) m_m.send_button(cc, now);
-			}
+			if (!is_sent(b.action)) continue;
+			m_out->send_button(static_cast<uint8_t>(b.action), now);
+			if (now) m_last_action = b.action;
 		}
+		return exit_requested;
 	}
 
-	// Clear every bound button in `s` (no-op while DAW mode is off).
-	void mask(sc::SCState& s) const
+	static const char* action_name(mappings::DawAction a)
 	{
-		if (!m_enabled) return;
-		for (const auto& b : mappings::TRANSPORT_BINDINGS)
-		{
-			if (b.action != mappings::TransportAction::NONE)
-				button(s, b.button) = false;
-		}
-	}
-
-	static const char* action_name(mappings::TransportAction a)
-	{
-		using A = mappings::TransportAction;
+		using A = mappings::DawAction;
 		switch (a)
 		{
-		case A::PLAY:         return "PLAY";
-		case A::STOP:         return "STOP";
-		case A::RECORD:       return "REC";
-		case A::PAUSE:        return "PAUSE";
-		case A::REWIND:       return "REW";
-		case A::FAST_FORWARD: return "FFWD";
-		case A::GOTO_START:   return "START";
-		default:              return "-";
+		case A::PLAY_STOP:        return "Play/Stop";
+		case A::STOP:             return "Stop";
+		case A::RECORD:           return "Rec";
+		case A::RECORD_TAKE:      return "RecTake";
+		case A::UNDO:             return "Undo";
+		case A::JUMP_BACK:        return "-1bar";
+		case A::JUMP_FORWARD:     return "+1bar";
+		case A::JUMP_BACK_BIG:    return "-Nbars";
+		case A::JUMP_FORWARD_BIG: return "+Nbars";
+		case A::GOTO_START:       return "Start";
+		case A::PREV_MARKER:      return "PrevMark";
+		case A::NEXT_MARKER:      return "NextMark";
+		case A::ADD_MARKER:       return "AddMark";
+		case A::TOGGLE_LOOP:      return "Loop";
+		case A::TOGGLE_METRONOME: return "Click";
+		case A::SELECT_LEFT:      return "ClipLeft";
+		case A::SELECT_RIGHT:     return "ClipRight";
+		case A::SELECT_AT_CURSOR: return "ClipAtCursor";
+		case A::TRACK_PREV:       return "TrackUp";
+		case A::TRACK_NEXT:       return "TrackDown";
+		case A::EXIT_DAW_MODE:    return "Exit";
+		default:                  return "-";
 		}
 	}
 
-	static const char* button_name(mappings::TransportButton b)
+	static const char* button_name(mappings::DawButton b)
 	{
-		using B = mappings::TransportButton;
+		using B = mappings::DawButton;
 		switch (b)
 		{
 		case B::LPAD_CLICK:  return "LPad";
@@ -1140,9 +1152,14 @@ public:
 	}
 
 private:
-	static bool& button(sc::SCState& s, mappings::TransportButton b)
+	static bool is_sent(mappings::DawAction a)
 	{
-		using B = mappings::TransportButton;
+		return a != mappings::DawAction::NONE && a != mappings::DawAction::EXIT_DAW_MODE;
+	}
+
+	static bool button(const sc::SCState& s, mappings::DawButton b)
+	{
+		using B = mappings::DawButton;
 		switch (b)
 		{
 		case B::LPAD_CLICK:  return s.lpad_click;
@@ -1170,60 +1187,12 @@ private:
 		case B::LTRIG_CLICK: return s.ltrig_click;
 		case B::RTRIG_CLICK: return s.rtrig_click;
 		}
-		return s.lpad_click; // unreachable
+		return false;
 	}
 
-	static bool button(const sc::SCState& s, mappings::TransportButton b)
-	{
-		return button(const_cast<sc::SCState&>(s), b);
-	}
-
-	static uint8_t action_cc(mappings::TransportAction a)
-	{
-		using A = mappings::TransportAction;
-		switch (a)
-		{
-		case A::PLAY:         return mappings::CC_TRANSPORT_PLAY;
-		case A::STOP:         return mappings::CC_TRANSPORT_STOP;
-		case A::RECORD:       return mappings::CC_TRANSPORT_RECORD;
-		case A::PAUSE:        return mappings::CC_TRANSPORT_PAUSE;
-		case A::REWIND:       return mappings::CC_TRANSPORT_REWIND;
-		case A::FAST_FORWARD: return mappings::CC_TRANSPORT_FAST_FORWARD;
-		case A::GOTO_START:   return mappings::CC_TRANSPORT_GOTO_START;
-		default:              return 255;
-		}
-	}
-
-	void send_mmc(mappings::TransportAction a)
-	{
-		using A = mappings::TransportAction;
-		const uint8_t dev = mappings::MMC_DEVICE_ID;
-		if (a == A::GOTO_START)
-		{
-			// MMC LOCATE (target) to hh:mm:ss:ff:sf = 00:00:00:00:00
-			const unsigned char msg[] = { 0xF0, 0x7F, dev, 0x06, 0x44, 0x06, 0x01,
-				0x00, 0x00, 0x00, 0x00, 0x00, 0xF7 };
-			m_m.send_sysex(msg, sizeof(msg));
-			return;
-		}
-		uint8_t cmd = 0;
-		switch (a)
-		{
-		case A::STOP:         cmd = 0x01; break;
-		case A::PLAY:         cmd = 0x02; break;
-		case A::FAST_FORWARD: cmd = 0x04; break;
-		case A::REWIND:       cmd = 0x05; break;
-		case A::RECORD:       cmd = 0x06; break; // record strobe
-		case A::PAUSE:        cmd = 0x09; break;
-		default: return;
-		}
-		const unsigned char msg[] = { 0xF0, 0x7F, dev, 0x06, cmd, 0xF7 };
-		m_m.send_sysex(msg, sizeof(msg));
-	}
-
-	MidiEmitter& m_m;
+	MidiEmitter* m_out;
 	bool m_enabled = mappings::DAW_MODE_DEFAULT_ON;
-	mappings::TransportAction m_last_action = mappings::TransportAction::NONE;
+	mappings::DawAction m_last_action = mappings::DawAction::NONE;
 };
 
 // Everything analog or ambient: sticks, pads, triggers, pitch bend, tilt,
@@ -1397,7 +1366,7 @@ static void render(std::ostringstream& os, const char* label, int raw, int range
 }
 
 static void redraw(const sc::SCState& s, const MidiEmitter& m, const NoteEmitter& n,
-	const TransportEmitter& t, bool idle, bool learn)
+	const DawMode& d, const std::string& daw_port, bool idle, bool learn)
 {
 	std::ostringstream os;
 	static bool first = true;
@@ -1528,14 +1497,20 @@ static void redraw(const sc::SCState& s, const MidiEmitter& m, const NoteEmitter
 		}
 		os << "\033[K\n";
 	}
-	os << "  DAW:      " << (t.enabled() ? "ON " : "OFF") << " (press D)  ";
-	for (const auto& b : mappings::TRANSPORT_BINDINGS)
+	os << "  DAW mode: "
+		<< (d.enabled() ? "\033[35mON \033[0m" : "OFF")
+		<< " (press D)  -> " << daw_port << " ch" << (mappings::DAW_MIDI_CHANNEL + 1)
+		<< "  last=" << DawMode::action_name(d.last_action()) << "\033[K\n";
+	os << "            ";
+	if (d.enabled())
 	{
-		if (b.action == mappings::TransportAction::NONE) continue;
-		os << TransportEmitter::button_name(b.button) << "="
-			<< TransportEmitter::action_name(b.action) << " ";
+		for (const auto& b : mappings::DAW_BINDINGS)
+		{
+			if (b.action == mappings::DawAction::NONE) continue;
+			os << DawMode::button_name(b.button) << "=" << DawMode::action_name(b.action) << " ";
+		}
 	}
-	os << " last=" << TransportEmitter::action_name(t.last_action()) << "\033[K\n";
+	os << "\033[K\n";
 	os << "  Learn:    "
 		<< (learn ? "\033[36mON  - continuous CCs muted, only buttons are sent\033[0m" : "OFF")
 		<< " (press L)\033[K\n";
@@ -1608,15 +1583,56 @@ int main()
 	std::cout << "Sending MIDI CC on channel " << static_cast<int>(mappings::MIDI_CHANNEL + 1)
 		<< ". Live dashboard (Ctrl+C to exit):\n\n";
 
+	// DAW commands go to their own port when one matches DAW_PORT_MATCH (e.g.
+	// a second loopMIDI port "loopMIDI DAW"), so they never reach instruments.
+	// Until such a port exists they share the main port; we look again every
+	// time DAW mode is entered, so creating the port later just works.
+	libremidi::midi_out daw_midi;
+	std::string daw_port_name = out_port->port_name + " (shared, no \"DAW\" port found)";
+	bool daw_separate = false;
+
 	MidiEmitter emitter(midi, mappings::MIDI_CHANNEL);
+	MidiEmitter daw_shared_emitter(midi, mappings::DAW_MIDI_CHANNEL);
+	MidiEmitter daw_port_emitter(daw_midi, mappings::DAW_MIDI_CHANNEL);
 	NoteEmitter notes(emitter);
-	TransportEmitter transport(emitter);
+	DawMode daw(daw_shared_emitter);
+
+	auto find_daw_port = [&]()
+	{
+		if (daw_separate) return;
+		libremidi::observer obs;
+		for (const libremidi::output_port& p : obs.get_output_ports())
+		{
+			if (p.port_name == out_port->port_name || !icontains(p.port_name, mappings::DAW_PORT_MATCH))
+				continue;
+			daw_midi.open_port(p);
+			if (!daw_midi.is_port_open()) continue;
+			daw_port_name = p.port_name;
+			daw_separate = true;
+			daw.set_output(daw_port_emitter);
+			return;
+		}
+	};
+	find_daw_port();
+	std::cout << "DAW mode commands -> " << daw_port_name << '\n';
+
+	auto set_daw_mode = [&](bool on)
+	{
+		if (on == daw.enabled()) return;
+		if (on)
+		{
+			find_daw_port();
+			// Leaving the instrument: silence notes and release button CCs.
+			notes.panic();
+			emit_buttons(emitter, sc::SCState{});
+		}
+		daw.set_enabled(on);
+	};
 
 	auto last_lizard_refresh = std::chrono::steady_clock::now();
 	auto last_redraw = std::chrono::steady_clock::now() - std::chrono::seconds(1);
 	sc::SCState state;
-	sc::SCState prev_state;        // raw, for transport edge detection
-	sc::SCState prev_masked_state; // masked, for note edge detection
+	sc::SCState prev_state;
 	bool have_prev = false;
 	auto last_report = std::chrono::steady_clock::now();
 	bool idle = false; // no reports for a while: controller asleep / off
@@ -1639,7 +1655,7 @@ int main()
 			if (now - last_report >= std::chrono::seconds(2)) idle = true;
 			if (idle && now - last_redraw >= std::chrono::milliseconds(250))
 			{
-				redraw(prev_state, emitter, notes, transport, idle, learn_mode);
+				redraw(prev_state, emitter, notes, daw, daw_port_name, idle, learn_mode);
 				last_redraw = now;
 			}
 			continue;
@@ -1662,34 +1678,36 @@ int main()
 			else if (c == '3') notes.set_layout(mappings::NoteLayout::SCALE);
 			else if (c == '4') notes.set_layout(mappings::NoteLayout::CHORD);
 			else if (c == '5') notes.set_layout(mappings::NoteLayout::LSDJ);
-			else if (c == 'd' || c == 'D') transport.toggle();
+			else if (c == 'd' || c == 'D') set_daw_mode(!daw.enabled());
 			else if (c == 'l' || c == 'L') learn_mode = !learn_mode;
 		}
 
-		// DAW mode: transport-bound buttons fire transport commands and are
-		// hidden from the regular CC + note paths.
-		if (have_prev) transport.update(state, prev_state);
-		sc::SCState masked = state;
-		transport.mask(masked);
-
-		if (!learn_mode) emit_continuous(emitter, masked);
-		emit_buttons(emitter, masked);
-		if constexpr (mappings::ENABLE_NOTES)
+		if (daw.enabled())
 		{
-			if (have_prev) notes.update(masked, prev_masked_state);
+			// DAW mode: buttons send DAW commands only.
+			if (have_prev && daw.update(state, prev_state)) set_daw_mode(false);
+		}
+		else
+		{
+			if (!learn_mode) emit_continuous(emitter, state);
+			emit_buttons(emitter, state);
+			if constexpr (mappings::ENABLE_NOTES)
+			{
+				if (have_prev) notes.update(state, prev_state);
+			}
 		}
 		prev_state = state;
-		prev_masked_state = masked;
 		have_prev = true;
 
 		if (now - last_redraw >= std::chrono::milliseconds(REDRAW_INTERVAL_MS))
 		{
-			redraw(state, emitter, notes, transport, idle, learn_mode);
+			redraw(state, emitter, notes, daw, daw_port_name, idle, learn_mode);
 			last_redraw = now;
 		}
 	}
 
 	midi.close_port();
+	if (daw_separate) daw_midi.close_port();
 	hid_exit();
 	return 0;
 }

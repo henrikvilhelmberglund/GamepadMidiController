@@ -90,22 +90,53 @@ Polyphonic. Each button plays a chord. Two sub-modes:
 
 In both sub-modes, `L3`/`R3` (default sub-mode) cycles scale, and the chord qualities adapt automatically.
 
-## DAW mode (transport control)
+## DAW mode
 
-Press `D` in the console to toggle. It is an overlay on top of whichever note mode is active, so you can keep playing and still control the transport. Default bindings:
+A separate mode for driving the DAW, e.g. while recording audio with an instrument in your hands. It is on when the app starts; toggle it with `D` in the console. While DAW mode is on, the controller sends only DAW commands: no notes, no CCs.
 
-| Button | Action |
-|--------|--------|
-| Left trackpad click  | Record |
-| Right trackpad click | Stop |
+| Button | Action | Button | Action |
+|--------|--------|--------|--------|
+| **Left pad click** | **Record take** (see below); again to stop | DPad ← / → | −1 / +1 bar |
+| **Right pad click** | Play / stop (like spacebar); stops a take too | LB / RB | −N / +N bars (N = 4 by default) |
+| A / B | Play-stop / stop | DPad ↑ / ↓ | Select the track above / below |
+| Y | Undo | R3 | Add cue marker |
+| Menu | Plain record toggle | L3 | Go to start |
+| View | Metronome on/off | QAM | Loop on/off |
+| L4 / R4 | Select the clip to the left / right on the track | R5 | Select the clip under the play cursor (click any clip on that track once first) |
 
-While DAW mode is on, bound buttons send transport commands *instead of* their normal CC / note. Each press is sent as:
-- **MMC** (MIDI Machine Control) SysEx: Play / Stop / Record strobe / Pause / Rewind / FFwd / Locate-to-start. Enable MMC / control-message input for the port in your DAW (e.g. Reaper: Preferences → MIDI Devices → input → "Enable input for control messages").
-- **A dedicated CC** per action (127 on press, 0 on release) for DAWs that ignore MMC (Ableton, Bitwig, FL): MIDI-learn the transport button to it. Defaults: Play 85, Stop 86, Record 87, Pause 89, Rewind 90, FFwd 119, Go-to-start 3.
+Change the layout in the `DAW_BINDINGS` table in [mappings.h](GamepadMidiController/mappings.h).
 
-**MIDI-learning the transport CCs:** press `L` first. Learn mode mutes every continuous/ambient CC (sticks, pads, triggers, gyro, accel, tilt, pad pressure, capacitive touch) so the DAW's learn only sees the button you press. Press `L` again when done.
+Each command is a CC on **MIDI channel 16** whose number is the action (`mappings::DawAction`). If an output port with "DAW" in its name exists, the commands go there instead of the main port.
 
-Add more bindings or change the defaults in the `TRANSPORT_BINDINGS` table in [mappings.h](GamepadMidiController/mappings.h).
+### Bitwig setup
+
+1. In loopMIDI, add a second port called `loopMIDI DAW` (recommended; keeps DAW commands away from your instrument input).
+2. Copy [bitwig/GamepadMidiController.control.js](bitwig/GamepadMidiController.control.js) into `Documents/Bitwig Studio/Controller Scripts/GamepadMidiController/`.
+3. Bitwig → Settings → Controllers → Add controller → *GamepadMidiController* → *Steam Controller DAW*, input = `loopMIDI DAW`.
+
+### Record take: back-to-back audio takes on one track
+
+Click the left pad to start a take: playback starts **pre-roll** beats (default 2) before the cursor so you get a lead-in. Click it again (or the right pad) to stop. The cursor then returns to where the take started, so the next click redoes the same section; jump ahead with LB/RB to move on. Every take runs with Arranger Overdub on, so recording over an existing clip adds a comp lane instead of cutting it. Three take modes (controller preferences → *Take mode*):
+
+- **Punch in at the cursor** (default): recording starts an **early margin** (default 80 ms) before the cursor and runs until you stop. The pre-roll is only a lead-in and never covers the previous take. Anything played before the punch-in point isn't recorded (Bitwig discards it).
+- **Record everything**: recording starts with the pre-roll, so nothing you play is lost, but the pre-roll covers the end of the previous take until you swipe the comp boundary.
+- **Punch in/out at markers**: like punch-in, plus a cue marker at each take's start and end; a take punches out at the next marker so it can't run into material after it, even if you stop late. This is the only mode that adds markers.
+
+Bitwig's punch points are the arranger loop brace, so the punch modes move the loop brace during a take and restore your loop and punch settings afterwards.
+
+**Selecting takes:** L4 / R4 select the clip to the left / right, R5 selects the clip under the play cursor. They step from the current selection (like the arrow keys), so click one clip on the track in the arranger first; moving the cursor with the controller or the ruler keeps that selection.
+
+Take mode, pre-roll, early margin, overdub, the bar count for big jumps and where the cursor goes after a take ("Take start" / "Next bar after stop") are under the controller's preferences in Bitwig.
+
+For other DAWs, MIDI-learn the channel-16 CCs (press `L` first, see below).
+
+### Debugging the Bitwig script
+
+The script listens for SysEx debug commands (`F0 7D <ASCII command> F7`) on its MIDI input. These can invoke any Bitwig action by id, move the cursor, or log the transport, the selected clip and the script's state to `Documents/Bitwig Studio/GamepadMidiController-debug.txt`. The command list is at the debug-hook comment in [the script](bitwig/GamepadMidiController.control.js). Never write files into the script's own folder: Bitwig reloads the script whenever anything there changes, which loses a take in progress.
+
+### Learn mode
+
+Press `L` to mute every continuous/ambient CC (sticks, pads, triggers, gyro, accel, tilt, pad pressure, capacitive touch), so a DAW's MIDI learn only sees the button you press. Press `L` again when done.
 
 ## MIDI output (default)
 

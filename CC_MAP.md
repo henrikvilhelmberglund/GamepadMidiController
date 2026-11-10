@@ -108,19 +108,24 @@ Examples: hold LB + R4 = -11 semitones (octave down, then up a semitone). Hold L
 | 117 | R5 paddle | button |
 | 118 | QAM (quick access menu) | button |
 
-## DAW mode transport — MMC + CC 3, 85-90, 119
+## DAW mode — CC 1-15 on MIDI channel 16
 
-Only active while DAW mode is on (toggle with `D` in the console). Bound buttons (default: left pad click = Record, right pad click = Stop) send an MMC SysEx command plus the CC below, and stop sending their normal CC / note while DAW mode is on.
+Sent only while DAW mode is on (toggle with `D` in the console). Nothing else is sent in DAW mode. Value 127 on press, 0 on release. Goes to a port with "DAW" in its name if one exists, else the main port. The Bitwig script in [bitwig/](bitwig/GamepadMidiController.control.js) handles these; see the README for the button layout.
 
-| CC  | Action | MMC |
-|-----|--------|-----|
-| 85  | Play         | `F0 7F 7F 06 02 F7` |
-| 86  | Stop         | `F0 7F 7F 06 01 F7` |
-| 87  | Record       | `F0 7F 7F 06 06 F7` (record strobe) |
-| 89  | Pause        | `F0 7F 7F 06 09 F7` |
-| 90  | Rewind       | `F0 7F 7F 06 05 F7` |
-| 119 | Fast forward | `F0 7F 7F 06 04 F7` |
-| 3   | Go to start  | `F0 7F 7F 06 44 06 01 00 00 00 00 00 F7` (locate) |
+| CC (ch 16) | Action |
+|----|--------|
+| 1  | Play / stop |
+| 2  | Stop |
+| 3  | Record (plain toggle) |
+| 4  | Record take (pre-roll lead-in, punch-in just before the cursor) |
+| 5  | Undo |
+| 6 / 7 | −1 / +1 bar |
+| 8 / 9 | −N / +N bars |
+| 10 | Go to start |
+| 11 / 12 | Previous / next cue marker |
+| 13 | Add cue marker |
+| 14 | Loop on/off |
+| 15 | Metronome on/off |
 
 ## Expansion ideas
 

@@ -391,37 +391,48 @@ constexpr int LSDJ_OFF_VIEW       = +12; // Start  - octave up
 // array in update_lsdj() if you want it.
 
 // ----------------------------------------------------------------------------
-// DAW MODE (transport control)
+// DAW MODE
 // ----------------------------------------------------------------------------
-// Overlay toggled by pressing 'D' in the console. Independent of the note
-// layout (1-5), so you can keep playing notes and hit record/stop.
+// A separate mode for driving the DAW (built for recording audio takes with
+// the controller as a remote). Toggle it with 'D' in the console. While DAW
+// mode is on, the controller sends nothing but DAW commands: no notes, no CCs.
 //
-// While DAW mode is ON, every button bound below sends a transport command
-// on press INSTEAD of its normal CC / note behaviour (the button is masked
-// out of the regular CC + note handling, so nothing double-fires).
+// Each command is a CC on DAW_MIDI_CHANNEL whose number is the DawAction value
+// (127 on press, 0 on release). The Bitwig script in bitwig/ turns them into
+// actions; for another DAW, MIDI-learn them.
 //
-// Each transport press is sent two ways (toggle either off below):
-//   * MMC (MIDI Machine Control) SysEx - understood natively by e.g. Reaper,
-//     Cubase, Logic, Studio One, Pro Tools (enable "control messages" / MMC
-//     input for the port in the DAW's MIDI preferences).
-//   * A dedicated CC per action (127 on press, 0 on release) - for DAWs that
-//     ignore MMC (Ableton Live, Bitwig, FL Studio): MIDI-learn the transport
-//     button to this CC.
+// Port: if an output port whose name contains DAW_PORT_MATCH exists (e.g. a
+// second loopMIDI port called "loopMIDI DAW"), DAW commands go there so they
+// never mix with your instrument input. Otherwise they go to the main port.
 
-enum class TransportAction
+// Keep the numbers in sync with bitwig/GamepadMidiController.control.js.
+enum class DawAction : uint8_t
 {
-	NONE,
-	PLAY,
-	STOP,
-	RECORD,        // MMC "record strobe" - punches in / starts recording
-	PAUSE,
-	REWIND,        // MMC shuttle rewind (runs until STOP/PLAY)
-	FAST_FORWARD,  // MMC shuttle fast-forward (runs until STOP/PLAY)
-	GOTO_START,    // MMC locate to 00:00:00:00
+	NONE             = 0,
+	PLAY_STOP        = 1,
+	STOP             = 2,
+	RECORD           = 3,   // plain record toggle
+	RECORD_TAKE      = 4,   // pre-roll + alternate "Take" tracks (see the script)
+	UNDO             = 5,
+	JUMP_BACK        = 6,   // -1 bar
+	JUMP_FORWARD     = 7,   // +1 bar
+	JUMP_BACK_BIG    = 8,   // -N bars (N set in the script's preferences)
+	JUMP_FORWARD_BIG = 9,   // +N bars
+	GOTO_START       = 10,
+	PREV_MARKER      = 11,
+	NEXT_MARKER      = 12,
+	ADD_MARKER       = 13,
+	TOGGLE_LOOP      = 14,
+	TOGGLE_METRONOME = 15,
+	SELECT_LEFT      = 16,  // select the previous clip on the track (arrow left)
+	SELECT_RIGHT     = 17,  // select the next clip on the track (arrow right)
+	SELECT_AT_CURSOR = 18,  // select the clip under the play cursor (same track as the selection)
+	TRACK_PREV       = 19,  // select the track above
+	TRACK_NEXT       = 20,  // select the track below
+	EXIT_DAW_MODE    = 127, // handled by the app itself, never sent
 };
 
-// Buttons that can be bound to a transport action.
-enum class TransportButton
+enum class DawButton
 {
 	LPAD_CLICK, RPAD_CLICK,
 	A, B, X, Y,
@@ -432,35 +443,38 @@ enum class TransportButton
 	LTRIG_CLICK, RTRIG_CLICK,
 };
 
-struct TransportBinding
+struct DawBinding
 {
-	TransportButton button;
-	TransportAction action;
+	DawButton button;
+	DawAction action;
 };
 
-// Add / change bindings here. A button may appear at most once.
-constexpr TransportBinding TRANSPORT_BINDINGS[] = {
-	{ TransportButton::LPAD_CLICK, TransportAction::RECORD },
-	{ TransportButton::RPAD_CLICK, TransportAction::STOP },
-	// Examples:
-	// { TransportButton::R3,     TransportAction::PLAY },
-	// { TransportButton::L3,     TransportAction::GOTO_START },
+// Button layout while DAW mode is on. A button may appear at most once.
+constexpr DawBinding DAW_BINDINGS[] = {
+	{ DawButton::LPAD_CLICK, DawAction::RECORD_TAKE },
+	{ DawButton::RPAD_CLICK, DawAction::PLAY_STOP },
+	{ DawButton::A,          DawAction::PLAY_STOP },
+	{ DawButton::B,          DawAction::STOP },
+	{ DawButton::Y,          DawAction::UNDO },
+	{ DawButton::DPAD_LEFT,  DawAction::JUMP_BACK },
+	{ DawButton::DPAD_RIGHT, DawAction::JUMP_FORWARD },
+	{ DawButton::LB,         DawAction::JUMP_BACK_BIG },
+	{ DawButton::RB,         DawAction::JUMP_FORWARD_BIG },
+	{ DawButton::DPAD_UP,    DawAction::TRACK_PREV },
+	{ DawButton::DPAD_DOWN,  DawAction::TRACK_NEXT },
+	{ DawButton::L3,         DawAction::GOTO_START },
+	{ DawButton::R3,         DawAction::ADD_MARKER },
+	{ DawButton::VIEW,       DawAction::TOGGLE_METRONOME },
+	{ DawButton::MENU,       DawAction::RECORD },
+	{ DawButton::QAM,        DawAction::TOGGLE_LOOP },
+	{ DawButton::L4,         DawAction::SELECT_LEFT },
+	{ DawButton::R4,         DawAction::SELECT_RIGHT },
+	{ DawButton::R5,         DawAction::SELECT_AT_CURSOR },
 };
 
-constexpr bool DAW_MODE_DEFAULT_ON = false;
+constexpr bool DAW_MODE_DEFAULT_ON = true; // start in DAW mode ('D' toggles)
+constexpr uint8_t DAW_MIDI_CHANNEL = 15;     // 0-indexed: MIDI channel 16
+constexpr const char* DAW_PORT_MATCH = "DAW"; // case-insensitive substring
 
-constexpr bool TRANSPORT_SEND_MMC = true;
-constexpr uint8_t MMC_DEVICE_ID = 0x7F; // 0x7F = "all call" (every device listens)
-
-constexpr bool TRANSPORT_SEND_CC = true;
-// Picked from the MIDI spec's "undefined" CCs so they don't collide with
-// anything above.
-constexpr uint8_t CC_TRANSPORT_PLAY         = 85;
-constexpr uint8_t CC_TRANSPORT_STOP         = 86;
-constexpr uint8_t CC_TRANSPORT_RECORD       = 87;
-constexpr uint8_t CC_TRANSPORT_PAUSE        = 89;
-constexpr uint8_t CC_TRANSPORT_REWIND       = 90;
-constexpr uint8_t CC_TRANSPORT_FAST_FORWARD = 119;
-constexpr uint8_t CC_TRANSPORT_GOTO_START   = 3;
 
 } // namespace mappings
